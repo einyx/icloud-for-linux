@@ -52,11 +52,11 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           stage="dist/icloud-for-linux-${version}"
           mkdir -p "$stage"
-          install -Dm755 "target/${matrix.target}/release/icloudctl" "$stage/icloudctl"
+          install -Dm755 "target/${{ matrix.target }}/release/icloudctl" "$stage/icloudctl"
           install -Dm644 LICENSE "$stage/LICENSE"
           install -Dm644 README.md "$stage/README.md"
           install -Dm644 config.example.yaml "$stage/config.example.yaml"
-          tar -czf "dist/icloud-for-linux-${version}-linux-${matrix.arch}.tar.gz" -C dist "icloud-for-linux-${version}"
+          tar -czf "dist/icloud-for-linux-${version}-linux-${{ matrix.arch }}.tar.gz" -C dist "icloud-for-linux-${version}"
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
