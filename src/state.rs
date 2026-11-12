@@ -274,6 +274,17 @@ impl SyncState {
         Ok(())
     }
 
+    /// Mark a path as locally deleted: it stays in the index until the deletion
+    /// has been uploaded, but it disappears from the mount immediately.
+    pub fn mark_tombstone(&self, path: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE entries SET tombstone=1, dirty=1 WHERE path=?1",
+            params![path],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_clean(&self, path: &str) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(

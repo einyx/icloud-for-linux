@@ -208,9 +208,13 @@ fn cmd_mount(mount_dir: Option<PathBuf>, config: Option<PathBuf>, foreground: bo
         mirror.clone(),
         Box::new(client),
     ));
-    if foreground {
-        engine.start_background().ok();
+    // The sync engine primes the local index before the mount is served.
+    // Failures are non-fatal: the filesystem still mounts and serves the
+    // local mirror, which keeps the driver usable in degraded mode.
+    if let Err(e) = engine.start_background() {
+        tracing::warn!(error = %e, "sync engine start failed — mounting in local-only mode");
     }
+    let _ = foreground;
 
     let hydrate: fuse_fs::HydrateFn = {
         let engine = engine.clone();

@@ -93,7 +93,16 @@ impl ICloudFs {
                 } else {
                     0o644
                 };
-                (e.size.max(0) as u64, e.mtime.max(0) as u64, kind, perm)
+                let size = if e.entry_type == "folder" {
+                    0
+                } else {
+                    // The mirror is the source of truth for a hydrated file: the
+                    // index can lag behind a local write until the next sync
+                    // pass, but the kernel must never observe a stale size.
+                    self.local_size(path)
+                        .unwrap_or_else(|| e.size.max(0) as u64)
+                };
+                (size, e.mtime.max(0) as u64, kind, perm)
             }
             None => (0, 0, FileType::Directory, 0o755),
         };
@@ -117,11 +126,40 @@ impl ICloudFs {
         }
     }
 
+    /// Attributes of the mount root. The root always exists, even when the
+    /// index has not been populated yet — replying ENOENT for it would make
+    /// the whole mountpoint disappear.
+    fn attr_of_root(&self) -> FileAttr {
+        FileAttr {
+            ino: ROOT_INO,
+            size: 0,
+            blocks: 0,
+            atime: SystemTime::now(),
+            mtime: SystemTime::now(),
+            ctime: SystemTime::now(),
+            crtime: SystemTime::now(),
+            kind: FileType::Directory,
+            perm: 0o755,
+            nlink: 2,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            rdev: 0,
+            blksize: 4096,
+            flags: 0,
+        }
+    }
+
     fn ensure_hydrated(&self, path: &str) -> Result<()> {
         if let Some(h) = &self.hydrate {
             h(path)?;
         }
         Ok(())
+    }
+
+    /// Size of the local mirror file, if it is present on disk.
+    fn local_size(&self, path: &str) -> Option<u64> {
+        let local = self.mirror.local_path(path).ok()?;
+        std::fs::metadata(local).ok().map(|m| m.len())
     }
 
     fn new_entry(&self, path: String, parent_path: String, kind: &str) -> Entry {
@@ -150,11 +188,11 @@ impl Filesystem for ICloudFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let path = self.path_of(parent, name);
         match self.state.get_entry(&path) {
-            Ok(Some(entry)) => {
+            Ok(Some(entry)) if !entry.tombstone => {
                 let attr = self.attr_of(&path, Some(&entry));
                 reply.entry(&TTL, &attr, 0);
             }
-            Ok(None) => reply.error(libc::ENOENT),
+            Ok(_) => reply.error(libc::ENOENT),
             Err(e) => {
                 tracing::error!(path = %path, error = %e, "lookup failed");
                 reply.error(libc::EIO);
@@ -167,7 +205,11 @@ impl Filesystem for ICloudFs {
             return reply.error(libc::ENOENT);
         };
         match self.state.get_entry(&path) {
-            Ok(entry) => reply.attr(&TTL, &self.attr_of(&path, entry.as_ref())),
+            Ok(Some(entry)) if !entry.tombstone => {
+                reply.attr(&TTL, &self.attr_of(&path, Some(&entry)))
+            }
+            Ok(None) if path == "/" => reply.attr(&TTL, &self.attr_of_root()),
+            Ok(_) => reply.error(libc::ENOENT),
             Err(e) => {
                 tracing::error!(path = %path, error = %e, "getattr failed");
                 reply.error(libc::EIO);
@@ -212,9 +254,13 @@ impl Filesystem for ICloudFs {
                 return reply.error(libc::EIO);
             }
         }
+        // The kernel resumes a directory listing from the cookie of the last
+        // entry it received, and only makes progress when every returned
+        // cookie is strictly greater than the requested offset. Cookies are
+        // therefore 1-based: entry `i` carries cookie `i + 1`.
         for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset.max(0) as usize) {
             let name = OsStr::from_bytes(&name);
-            let _ = reply.add(ino, i as i64, kind, name);
+            let _ = reply.add(ino, i as i64 + 1, kind, name);
         }
         reply.ok();
     }
@@ -280,7 +326,8 @@ impl Filesystem for ICloudFs {
         };
         match self.mirror.write(&path, offset.max(0) as u64, data) {
             Ok(n) => {
-                let _ = self.state.mark_dirty(&path, None, None);
+                let size = self.local_size(&path).map(|s| s as i64);
+                let _ = self.state.mark_dirty(&path, size, None);
                 reply.written(n);
             }
             Err(e) => {
@@ -350,7 +397,7 @@ impl Filesystem for ICloudFs {
         if let Err(_e) = self.mirror.remove_file(&path) {
             return reply.error(libc::EIO);
         }
-        let _ = self.state.mark_dirty(&path, None, None);
+        let _ = self.state.mark_tombstone(&path);
         reply.ok();
     }
 
@@ -361,6 +408,7 @@ impl Filesystem for ICloudFs {
         let path = self.path_of(parent, name);
         let _ = self.mirror.remove_tree(&path);
         let _ = self.state.remove_subtree(&path);
+        let _ = self.state.mark_tombstone(&path);
         reply.ok();
     }
 

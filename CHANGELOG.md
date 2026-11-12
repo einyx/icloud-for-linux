@@ -24,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release workflow publishing tarballs to GitHub Releases.
 - Documentation: README, ARCHITECTURE, ROADMAP, CONTRIBUTING, NOTICE.
 
+### Fixed
+
+- FUSE `readdir` cookies are now 1-based. The kernel only advances a directory
+  listing when every returned cookie is greater than the requested offset; the
+  previous 0-based cookies produced an infinite readdir loop that hung every
+  `ls` on the mountpoint.
+- The mount root is always reported as a directory, even before the index has
+  been populated. Answering ENOENT for the root made the whole mountpoint
+  disappear.
+- `getattr` reports the size of the local mirror file instead of the size
+  recorded in the index, so a file written through the mount is no longer
+  reported as empty.
+- Locally deleted paths are marked as tombstones: they disappear from the
+  listing immediately and stay in the index until the deletion is uploaded.
+
 ### Known limitations
 
 - The Apple/iCloud protocol client is not implemented yet; the driver currently
