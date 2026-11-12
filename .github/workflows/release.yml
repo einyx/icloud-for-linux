@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf dist/icloud-for-linux-linux-x86_64.tar.gz \
+            -C target/release icloudctl \
+            -C . LICENSE README.md config.example.yaml
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
+          body: |
+            ## icloud-for-linux
+
+            Rust rewrite of the iCloud Drive FUSE filesystem, released under the
+            GNU General Public License v3.0.
+
+            See the repository README for install instructions and the
+            [roadmap](docs/ROADMAP.md) for the current feature status.

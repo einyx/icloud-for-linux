@@ -1,0 +1,49 @@
+icloud-for-linux
+Copyright (C) 2026 einyx and contributors
+
+This program is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software Foundation,
+either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this
+program.  If not, see <https://www.gnu.org/licenses/>.
+
+--------------------------------------------------------------------------------
+
+Upstream project
+----------------
+
+icloud-for-linux is a Rust rewrite of, and is inspired by, the Python project:
+
+    icloud-linux — https://github.com/IsmaeelAkram/icloud-linux
+    Author: Ismaeel Akram
+
+The upstream repository contains no LICENSE file.  Unlicensed source is "All rights
+reserved" by default, so it cannot be redistributed as part of a derivative work
+without an explicit grant from the upstream author.
+
+Before publishing a build that incorporates upstream code, obtain one of:
+
+  (a) an explicit license grant from the upstream author (MIT/Apache-2.0/GPL-3.0 —
+      GPL-3.0 keeps the whole derivative under GPLv3, which is what this project
+      already uses), or
+  (b) confirmation that the Rust implementation is a clean-room, independent
+      implementation that does not reproduce upstream code.
+
+This project is distributed under GPL-3.0-only.  Any code that is copied from, or
+derived from, upstream must remain under a GPLv3-compatible license, and the
+corresponding source must be made available as required by GPLv3 section 6.
+
+Third-party dependencies
+------------------------
+
+This program uses third-party Rust crates, each distributed under its own license.
+See `Cargo.toml` / `Cargo.lock` for the exact set and versions; run `cargo license`
+or `cargo about` to produce a full attribution report.
+
+Apple, iCloud, macOS and iOS are trademarks of Apple Inc.  This project is not
+affiliated with, endorsed by, or sponsored by Apple Inc.

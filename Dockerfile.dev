@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+#
+# Development image: full toolchain, FUSE for integration testing, and the
+# tooling used by the Makefile targets (cargo-nextest, cargo-audit, just).
+#
+#   docker compose run --rm dev make check
+
+FROM rust:1.90-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        pkg-config \
+        gcc \
+        clang \
+        libssl-dev \
+        ca-certificates \
+        git \
+        curl \
+        make \
+        fuse3 \
+        fuse \
+        pkg-config \
+        sqlite3 \
+        jq \
+        xclip \
+        less \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+# Developer conveniences
+RUN rustup component add rustfmt clippy \
+    && cargo install cargo-watch cargo-audit just --locked
+
+ENV CARGO_TERM_COLOR=always \
+    RUST_BACKTRACE=1
+
+WORKDIR /workspace
+
+CMD ["bash"]

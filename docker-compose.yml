@@ -1,0 +1,68 @@
+# Development harness for icloud-for-linux.
+#
+#   docker compose run --rm dev make check     # fmt + clippy + tests
+#   docker compose run --rm dev bash           # interactive shell
+#   docker compose --profile fuse up mount     # run the FUSE mount in a container
+#
+# The `fuse` profile requires /dev/fuse and CAP_SYS_ADMIN; it is opt-in so the
+# default `dev` workflow works on machines without FUSE.
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target:/workspace/target
+    environment:
+      RUST_BACKTRACE: "1"
+      RUSTFLAGS: "-D warnings"
+    stdin_open: true
+    tty: true
+    command: ["bash"]
+
+  # Builds the release binary in the builder stage and runs it.
+  build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: icloud-for-linux:local
+    volumes:
+      - icloud-config:/var/config/icloud-linux
+      - icloud-cache:/var/cache/icloud-linux
+      - icloud-state:/var/state/icloud-linux
+    command: ["--version"]
+
+  # FUSE integration environment. Start with:
+  #   docker compose --profile fuse up mount
+  mount:
+    profiles: ["fuse"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: icloud-for-linux:local
+    devices:
+      - "/dev/fuse:/dev/fuse"
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - icloud-config:/var/config/icloud-linux
+      - icloud-cache:/var/cache/icloud-linux
+      - icloud-state:/var/state/icloud-linux
+      - fuse-mount:/mnt/icloud
+    command: ["mount", "--foreground", "/mnt/icloud"]
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  target:
+  icloud-config:
+  icloud-cache:
+  icloud-state:
+  fuse-mount:
