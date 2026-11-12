@@ -17,20 +17,46 @@ jobs:
   release:
     name: publish release
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --release
+      - name: Install cross toolchain
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Package
         run: |
-          mkdir -p dist
-          tar -czf dist/icloud-for-linux-linux-x86_64.tar.gz \
-            -C target/release icloudctl \
-            -C . LICENSE README.md config.example.yaml
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          stage="dist/icloud-for-linux-${version}"
+          mkdir -p "$stage"
+          install -Dm755 "target/${matrix.target}/release/icloudctl" "$stage/icloudctl"
+          install -Dm644 LICENSE "$stage/LICENSE"
+          install -Dm644 README.md "$stage/README.md"
+          install -Dm644 config.example.yaml "$stage/config.example.yaml"
+          tar -czf "dist/icloud-for-linux-${version}-linux-${matrix.arch}.tar.gz" -C dist "icloud-for-linux-${version}"
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
@@ -43,5 +69,19 @@ jobs:
             Rust rewrite of the iCloud Drive FUSE filesystem, released under the
             GNU General Public License v3.0.
 
-            See the repository README for install instructions and the
-            [roadmap](docs/ROADMAP.md) for the current feature status.
+            | Artifact | Architecture |
+            | --- | --- |
+            | `icloud-for-linux-*-linux-x86_64.tar.gz` | x86_64 |
+            | `icloud-for-linux-*-linux-aarch64.tar.gz` | arm64 |
+
+            ```bash
+            tar -xzf icloud-for-linux-*-linux-x86_64.tar.gz
+            sudo install -m755 icloud-for-linux-*/icloudctl /usr/local/bin/icloudctl
+            icloudctl init ~/iCloud
+            icloudctl configure
+            icloudctl auth
+            icloudctl mount ~/iCloud
+            ```
+
+            See the repository README for the full documentation and
+            [docs/ROADMAP.md](docs/ROADMAP.md) for the current feature status.

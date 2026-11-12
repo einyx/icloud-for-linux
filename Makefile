@@ -99,13 +99,19 @@ docker-clean: ## Remove container images/volumes
 	docker compose down -v --remove-orphans
 
 # ─────────────────────────── distribution ───────────────────────────
+ARCH ?= $(shell uname -m)
+
 .PHONY: dist
 dist: release ## Produce a release tarball in dist/
-	@mkdir -p $(DIST_DIR)
-	@tar -czf $(DIST_DIR)/$(PKG)-$(VERSION)-linux-x86_64.tar.gz \
-		-C $(TARGET_DIR)/release $(BINARY) \
-		-C . LICENSE README.md config.example.yaml
-	@echo "→ $(DIST_DIR)/$(PKG)-$(VERSION)-linux-x86_64.tar.gz"
+	@rm -rf $(DIST_DIR)/$(PKG)-$(VERSION)
+	@mkdir -p $(DIST_DIR)/$(PKG)-$(VERSION)
+	install -Dm755 $(TARGET_DIR)/release/$(BINARY) $(DIST_DIR)/$(PKG)-$(VERSION)/$(BINARY)
+	install -Dm644 LICENSE $(DIST_DIR)/$(PKG)-$(VERSION)/LICENSE
+	install -Dm644 README.md $(DIST_DIR)/$(PKG)-$(VERSION)/README.md
+	install -Dm644 config.example.yaml $(DIST_DIR)/$(PKG)-$(VERSION)/config.example.yaml
+	@tar -czf $(DIST_DIR)/$(PKG)-$(VERSION)-linux-$(ARCH).tar.gz -C $(DIST_DIR) $(PKG)-$(VERSION)
+	@rm -rf $(DIST_DIR)/$(PKG)-$(VERSION)
+	@echo "→ $(DIST_DIR)/$(PKG)-$(VERSION)-linux-$(ARCH).tar.gz"
 
 .PHONY: tag
 tag: ## Create an annotated release tag
