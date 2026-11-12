@@ -32,9 +32,9 @@ services:
       dockerfile: Dockerfile
     image: icloud-for-linux:local
     volumes:
-      - icloud-config:/var/config/icloud-linux
-      - icloud-cache:/var/cache/icloud-linux
-      - icloud-state:/var/state/icloud-linux
+      - icloud-config:/var/config/icloud-for-linux
+      - icloud-cache:/var/cache/icloud-for-linux
+      - icloud-state:/var/state/icloud-for-linux
     command: ["--version"]
 
   # FUSE integration environment. Start with:
@@ -52,9 +52,9 @@ services:
     security_opt:
       - apparmor:unconfined
     volumes:
-      - icloud-config:/var/config/icloud-linux
-      - icloud-cache:/var/cache/icloud-linux
-      - icloud-state:/var/state/icloud-linux
+      - icloud-config:/var/config/icloud-for-linux
+      - icloud-cache:/var/cache/icloud-for-linux
+      - icloud-state:/var/state/icloud-for-linux
       - fuse-mount:/mnt/icloud
     command: ["mount", "--foreground", "/mnt/icloud"]
 

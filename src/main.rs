@@ -1,4 +1,4 @@
-//! icloud-for-linux — mount iCloud Drive on Linux as a local-first FUSE filesystem.
+//! icloudctl — command line interface of icloud-for-linux.
 //!
 //! Copyright (C) 2026  einyx
 //!
@@ -12,20 +12,21 @@
 //! MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 //! GNU General Public License for more details.
 
-use icloud_for_linux::{auth, config, fuse_fs, icloud_api, mirror, service, state, sync};
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-use config::Config;
-use fuse_fs::ICloudFs;
-use icloud_api::{ICloudClient, UnimplementedClient};
-use mirror::LocalMirror;
-use state::SyncState;
-use sync::SyncEngine;
+use icloud_for_linux::blob::BlobStore;
+use icloud_for_linux::config::Config;
+use icloud_for_linux::db::Db;
+use icloud_for_linux::icloud_api::{ICloudClient, UnimplementedClient};
+use icloud_for_linux::index::Index;
+use icloud_for_linux::journal::Journal;
+use icloud_for_linux::service;
+use icloud_for_linux::sync::SyncEngine;
+use icloud_for_linux::vfs::{self, Vfs};
 
 #[derive(Parser)]
 #[command(
@@ -41,19 +42,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create config/cache directories, config file and the systemd user unit.
+    /// Create the local store, the config file and the systemd user unit.
     Init {
         /// Mount point (default: ~/iCloud)
         mount_dir: Option<PathBuf>,
     },
-    /// Write config.yaml with Apple ID credentials.
+    /// Write config.yaml with the Apple ID credentials.
     Configure {
         /// Apple ID email (prompted if omitted)
         email: Option<String>,
     },
     /// Run the interactive Apple ID / 2FA authentication bootstrap.
     Auth {
-        /// Bypass push delivery and force an SMS code (iOS 26 beta workaround).
+        /// Bypass push delivery and force an SMS code.
         #[arg(long)]
         force_sms: bool,
         /// Print Apple's reported auth mode for diagnosis.
@@ -66,11 +67,11 @@ enum Command {
         #[arg(long)]
         trust_token: Option<String>,
     },
-    /// Mount the iCloud Drive filesystem (runs in the foreground).
+    /// Mount the filesystem (runs in the foreground).
     Mount {
-        /// Mount point (default: read from ~/.config/icloud-linux/icloud.env)
+        /// Mount point (default: read from icloud.env)
         mount_dir: Option<PathBuf>,
-        /// Config file (default: ~/.config/icloud-linux/config.yaml)
+        /// Config file (default: ~/.config/icloud-for-linux/config.yaml)
         #[arg(long, short)]
         config: Option<PathBuf>,
         /// Keep the process in the foreground (used by the systemd unit).
@@ -82,31 +83,38 @@ enum Command {
         /// Mount point (default: read from icloud.env)
         mount_dir: Option<PathBuf>,
     },
-    /// Download all eligible file contents into the local mirror.
+    /// Run one sync pass: drain the journal and refresh stale metadata.
+    Sync {
+        /// Print what would happen without contacting the remote.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Download the content of every eligible file into the local store.
     Hydrate {
         /// Report what would be downloaded without downloading.
         #[arg(long)]
         dry_run: bool,
-        /// Print each file as it is hydrated.
-        #[arg(long)]
-        verbose: bool,
     },
-    /// Trigger an on-demand remote metadata sync in the running driver.
-    Sync {
-        /// Seconds to wait for completion.
-        #[arg(long, default_value_t = 900)]
-        timeout: u64,
-        /// Suppress progress output.
-        #[arg(long)]
-        quiet: bool,
+    /// Materialise a subtree of the drive as plain files in a directory.
+    Export {
+        /// iCloud path to export (e.g. /Downloads)
+        path: String,
+        /// Destination directory
+        dest: PathBuf,
     },
+    /// Re-hash every blob and report corruption.
+    Verify,
+    /// Remove blobs that nothing references any more.
+    Gc,
+    /// Show what the local index knows.
+    Index,
     /// Show whether the service is running.
     Status,
     /// Show service logs.
     Logs,
-    /// Check local setup health.
+    /// Check the local setup.
     Doctor,
-    /// Remove the local mirror and sync state, then rebuild on next start.
+    /// Remove the local store and rebuild it on the next start.
     ClearCache,
 }
 
@@ -130,6 +138,29 @@ fn resolve_mount(mount_dir: Option<PathBuf>) -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("/"))
                 .join("iCloud")
         })
+}
+
+/// Open the local store: blob store, index and journal.
+struct Store {
+    config: Config,
+    blobs: Arc<BlobStore>,
+    index: Arc<Index>,
+    journal: Arc<Journal>,
+}
+
+fn open_store(config_path: &Path) -> Result<Store> {
+    let config = Config::load(config_path).context("load config")?;
+    let cache = config.expanded_cache_dir();
+    let db = Arc::new(Db::open(&config.db_path())?);
+    let blobs = Arc::new(BlobStore::new(&cache)?);
+    let index = Arc::new(Index::new(db.clone()));
+    let journal = Arc::new(Journal::new(db.clone()));
+    Ok(Store {
+        config,
+        blobs,
+        index,
+        journal,
+    })
 }
 
 fn cmd_init(mount_dir: Option<PathBuf>) -> Result<()> {
@@ -165,7 +196,7 @@ fn cmd_configure(email: Option<String>) -> Result<()> {
             input.trim().to_string()
         }
     };
-    let password = rpassword_read()?;
+    let password = read_password()?;
     service::write_config(
         &service::config_file(),
         &email,
@@ -177,9 +208,8 @@ fn cmd_configure(email: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn rpassword_read() -> Result<String> {
+fn read_password() -> Result<String> {
     use std::io::Read;
-    // Read the password without echoing it back to the terminal.
     let mut password = String::new();
     let mut stdin = std::io::stdin().lock();
     let _ = stdin.read_to_string(&mut password);
@@ -188,43 +218,45 @@ fn rpassword_read() -> Result<String> {
 
 fn cmd_mount(mount_dir: Option<PathBuf>, config: Option<PathBuf>, foreground: bool) -> Result<()> {
     let config_path = resolve_config(config);
-    let cfg = Config::load(&config_path).context("load config")?;
+    let store = open_store(&config_path)?;
     let mount_dir = resolve_mount(mount_dir);
     service::ensure_dirs()?;
     std::fs::create_dir_all(&mount_dir)?;
 
-    let cache = cfg.expanded_cache_dir();
-    let mirror = Arc::new(LocalMirror::new(&cache)?);
-    let state = Arc::new(SyncState::open(&cache.join("state.sqlite3"))?);
-
     let mut client = UnimplementedClient;
     if let Err(e) = client.authenticate(!foreground) {
-        tracing::warn!(error = %e, "client authentication unavailable — running in local-only mode");
+        tracing::warn!(error = %e, "remote unavailable — running against the local store only");
     }
 
     let engine = Arc::new(SyncEngine::new(
-        cfg.clone(),
-        state.clone(),
-        mirror.clone(),
+        store.config.clone(),
+        store.index.clone(),
+        store.journal.clone(),
+        store.blobs.clone(),
         Box::new(client),
     ));
-    // The sync engine primes the local index before the mount is served.
-    // Failures are non-fatal: the filesystem still mounts and serves the
-    // local mirror, which keeps the driver usable in degraded mode.
-    if let Err(e) = engine.start_background() {
-        tracing::warn!(error = %e, "sync engine start failed — mounting in local-only mode");
+    if let Err(e) = engine.start() {
+        tracing::warn!(error = %e, "sync engine start failed");
     }
     let _ = foreground;
 
-    let hydrate: fuse_fs::HydrateFn = {
+    let hydrate: vfs::HydrateFn = {
         let engine = engine.clone();
         Arc::new(move |path: &str| engine.ensure_local_file(path))
     };
 
-    let fs = ICloudFs::new(state, mirror, Some(hydrate), cfg.fuse_options.ro);
-    let opts = fuse_fs::mount_options(&cfg.fuse_options);
+    let staging = store.config.expanded_cache_dir().join("staging");
+    let fs = Vfs::new(
+        store.index.clone(),
+        store.journal.clone(),
+        store.blobs.clone(),
+        staging,
+        Some(hydrate),
+        store.config.fuse_options.ro,
+    );
+    let opts = vfs::mount_options(&store.config.fuse_options);
     tracing::info!(mount = %mount_dir.display(), "mounting iCloud Drive");
-    fuse_fs::mount(fs, &mount_dir, opts)
+    vfs::mount(fs, &mount_dir, opts)
 }
 
 fn cmd_unmount(mount_dir: Option<PathBuf>) -> Result<()> {
@@ -235,71 +267,167 @@ fn cmd_unmount(mount_dir: Option<PathBuf>) -> Result<()> {
         .status();
     match status {
         Ok(s) if s.success() => println!("Unmounted {}", mount_dir.display()),
-        Ok(_) => println!("fusermount3 reported failure for {}", mount_dir.display()),
-        Err(e) => tracing::warn!(error = %e, "fusermount3 not available"),
+        Ok(_) => println!("fusermount3 reported a failure for {}", mount_dir.display()),
+        Err(e) => tracing::warn!(error = %e, "fusermount3 is not available"),
     }
     Ok(())
 }
 
-fn cmd_hydrate(dry_run: bool, verbose: bool) -> Result<()> {
+fn cmd_sync(dry_run: bool) -> Result<()> {
     let config_path = resolve_config(None);
-    let cfg = Config::load(&config_path).context("load config")?;
-    let cache = cfg.expanded_cache_dir();
-    let mirror = Arc::new(LocalMirror::new(&cache)?);
-    let state = Arc::new(SyncState::open(&cache.join("state.sqlite3"))?);
-    let engine = SyncEngine::new(cfg.clone(), state, mirror, Box::new(UnimplementedClient));
+    let store = open_store(&config_path)?;
+    let mut client = UnimplementedClient;
+    let _ = client.authenticate(false);
+    let engine = SyncEngine::new(
+        store.config.clone(),
+        store.index.clone(),
+        store.journal.clone(),
+        store.blobs.clone(),
+        Box::new(client),
+    );
+
+    let ops = store.journal.pending()?;
+    if dry_run {
+        println!("Pending operations: {}", ops.len());
+        for op in ops {
+            println!(
+                "  {:<7} {} -> {}",
+                op.op.as_str(),
+                op.path,
+                op.target_path.as_deref().unwrap_or("-")
+            );
+        }
+        let stale = store
+            .index
+            .stale_entries(store.config.index_ttl_seconds, 512)?;
+        println!("Stale index entries: {}", stale.len());
+        return Ok(());
+    }
+
+    let report = engine.sync_once()?;
+    println!(
+        "Sync complete: {} operation(s) applied, {} entry/entries refreshed",
+        report.drained, report.refreshed
+    );
+    Ok(())
+}
+
+fn cmd_hydrate(dry_run: bool) -> Result<()> {
+    let config_path = resolve_config(None);
+    let store = open_store(&config_path)?;
+    let mut client = UnimplementedClient;
+    let _ = client.authenticate(false);
+    let engine = SyncEngine::new(
+        store.config.clone(),
+        store.index.clone(),
+        store.journal.clone(),
+        store.blobs.clone(),
+        Box::new(client),
+    );
     let (pending, done) = engine.hydrate_all(dry_run)?;
-    let sync_paths = cfg
+    let sync_paths = store
+        .config
         .sync_paths
         .as_ref()
         .map(|v| v.join(", "))
         .unwrap_or_else(|| "(all)".to_string());
-    let exclude_paths = if cfg.exclude_paths.is_empty() {
+    let exclude_paths = if store.config.exclude_paths.is_empty() {
         "(none)".to_string()
     } else {
-        cfg.exclude_paths.join(", ")
+        store.config.exclude_paths.join(", ")
     };
     println!("icloud-for-linux hydrate");
-    println!("  Config:       {}", config_path.display());
-    println!("  sync_paths:   {}", sync_paths);
-    println!("  exclude_paths:{}", exclude_paths);
+    println!("  Config:        {}", config_path.display());
+    println!("  sync_paths:    {}", sync_paths);
+    println!("  exclude_paths: {}", exclude_paths);
     println!();
-    println!("  Eligible files needing download: {}", pending);
-    println!("  Already hydrated:                {}", done);
-    if verbose {
-        println!("  (verbose listing enabled)");
-    }
+    println!("  Files needing download: {}", pending);
+    println!("  Downloaded:              {}", done);
     if dry_run {
         println!("(dry run: nothing downloaded)");
     }
     Ok(())
 }
 
-fn cmd_sync(timeout: u64, quiet: bool) -> Result<()> {
-    let Some(pid) = service::service_main_pid() else {
-        anyhow::bail!("icloud.service is not running. Start it with: icloudctl mount");
-    };
-    let marker = service::state_dir().join("sync_done");
-    let _ = std::fs::remove_file(&marker);
-    unsafe {
-        if libc::kill(pid as i32, libc::SIGUSR1) != 0 {
-            anyhow::bail!("failed to signal driver process (pid {pid})");
+fn cmd_export(path: String, dest: PathBuf) -> Result<()> {
+    let config_path = resolve_config(None);
+    let store = open_store(&config_path)?;
+    let path = icloud_for_linux::config::normalize_icloud_path(&path);
+    let nodes = store.index.all()?;
+    let mut exported = 0;
+    for node in nodes {
+        if !node.path.starts_with(&path) {
+            continue;
+        }
+        let Some(digest) = node.digest.as_ref() else {
+            continue;
+        };
+        let relative = node.path.trim_start_matches(&path).trim_start_matches('/');
+        let target = dest.join(relative);
+        store.blobs.link_to(digest, &target)?;
+        exported += 1;
+    }
+    println!("Exported {exported} file(s) to {}", dest.display());
+    Ok(())
+}
+
+fn cmd_verify() -> Result<()> {
+    let config_path = resolve_config(None);
+    let store = open_store(&config_path)?;
+    let digests = store.blobs.list()?;
+    let mut bad = 0;
+    for digest in &digests {
+        if !store.blobs.verify(digest)? {
+            println!("CORRUPT: {digest}");
+            bad += 1;
         }
     }
-    if !quiet {
-        println!("Requested remote sync from pid {pid}; waiting up to {timeout}s...");
+    println!(
+        "Checked {} blob(s), {} corrupt, {} byte(s) on disk",
+        digests.len(),
+        bad,
+        store.blobs.total_size()?
+    );
+    if bad > 0 {
+        anyhow::bail!("{} corrupt blob(s)", bad);
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-    while std::time::Instant::now() < deadline {
-        if marker.exists() {
-            if !quiet {
-                println!("Sync complete.");
-            }
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-    anyhow::bail!("sync did not complete within {timeout}s")
+    Ok(())
+}
+
+fn cmd_gc() -> Result<()> {
+    let config_path = resolve_config(None);
+    let store = open_store(&config_path)?;
+    let mut client = UnimplementedClient;
+    let _ = client.authenticate(false);
+    let engine = SyncEngine::new(
+        store.config.clone(),
+        store.index.clone(),
+        store.journal.clone(),
+        store.blobs.clone(),
+        Box::new(client),
+    );
+    let live = engine.live_digests()?;
+    let removed = store.blobs.gc(&live)?;
+    println!(
+        "Removed {removed} unreferenced blob(s), {} kept",
+        live.len()
+    );
+    Ok(())
+}
+
+fn cmd_index() -> Result<()> {
+    let config_path = resolve_config(None);
+    let store = open_store(&config_path)?;
+    let (total, hydrated, dirty) = store.index.counts()?;
+    let (pending, failed, conflicts) = store.journal.counts()?;
+    println!("icloud-for-linux index");
+    println!("  Config:       {}", config_path.display());
+    println!("  Entries:      {}", total);
+    println!("  Hydrated:     {}", hydrated);
+    println!("  Pending sync: {}", dirty);
+    println!("  Journal:      {} pending, {} failed", pending, failed);
+    println!("  Conflicts:    {}", conflicts);
+    Ok(())
 }
 
 fn cmd_status() -> Result<()> {
@@ -311,7 +439,7 @@ fn cmd_status() -> Result<()> {
         pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
     );
     println!("mount:   {}", resolve_mount(None).display());
-    println!("cache:   {}", service::cache_dir().display());
+    println!("store:   {}", service::cache_dir().display());
     Ok(())
 }
 
@@ -333,10 +461,11 @@ fn cmd_doctor() -> Result<()> {
             "fusermount3",
             which("fusermount3").is_some() || which("fusermount").is_some(),
         ),
+        ("/dev/fuse", std::path::Path::new("/dev/fuse").exists()),
         ("config", service::config_file().exists()),
         ("env", service::env_file().exists()),
         ("unit", service::service_file().exists()),
-        ("cache dir", service::cache_dir().exists()),
+        ("store", service::cache_dir().exists()),
     ] {
         println!("{}: {}", if ok { "OK" } else { "MISSING" }, label);
     }
@@ -357,21 +486,21 @@ fn cmd_doctor() -> Result<()> {
     Ok(())
 }
 
-fn which(cmd: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|p| p.join(cmd))
-        .find(|c| c.is_file())
-}
-
 fn cmd_clear_cache() -> Result<()> {
     let cache = service::cache_dir();
     if cache.exists() {
         std::fs::remove_dir_all(&cache)?;
     }
     std::fs::create_dir_all(&cache)?;
-    println!("Cleared persistent cache under {}", cache.display());
+    println!("Cleared the local store under {}", cache.display());
     Ok(())
+}
+
+fn which(cmd: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|p| p.join(cmd))
+        .find(|c| c.is_file())
 }
 
 fn main() -> Result<()> {
@@ -387,7 +516,7 @@ fn main() -> Result<()> {
             trust_token,
         } => {
             let _ = trust_token;
-            auth::run_auth(&resolve_config(None), force_sms, debug, accept_terms)
+            icloud_for_linux::auth::run_auth(&resolve_config(None), force_sms, debug, accept_terms)
         }
         Command::Mount {
             mount_dir,
@@ -395,8 +524,12 @@ fn main() -> Result<()> {
             foreground,
         } => cmd_mount(mount_dir, config, foreground),
         Command::Unmount { mount_dir } => cmd_unmount(mount_dir),
-        Command::Hydrate { dry_run, verbose } => cmd_hydrate(dry_run, verbose),
-        Command::Sync { timeout, quiet } => cmd_sync(timeout, quiet),
+        Command::Sync { dry_run } => cmd_sync(dry_run),
+        Command::Hydrate { dry_run } => cmd_hydrate(dry_run),
+        Command::Export { path, dest } => cmd_export(path, dest),
+        Command::Verify => cmd_verify(),
+        Command::Gc => cmd_gc(),
+        Command::Index => cmd_index(),
         Command::Status => cmd_status(),
         Command::Logs => cmd_logs(),
         Command::Doctor => cmd_doctor(),

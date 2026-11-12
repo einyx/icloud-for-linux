@@ -1,49 +1,54 @@
-# Configuration file template (save as ~/.config/icloud-linux/config.yaml)
+# Configuration file template (save as ~/.config/icloud-for-linux/config.yaml)
 ---
 # iCloud credentials
 # NOTE: iCloud authentication requires your Apple ID account password.
 username: "your_apple_id@example.com"
 password: "your_apple_id_password"
 
-# Cache directory
-cache_dir: "~/.cache/icloud-linux"
+# Root of the local store: blobs, staging area, path index and journal.
+cache_dir: "~/.cache/icloud-for-linux"
 
-# Cache warmup mode. "background" mounts after metadata sync and hydrates file contents
-# in the background. "lazy" downloads file contents only when first opened.
-warmup_mode: "background"
+# Where the session cookies are kept.
+cookie_dir: "~/.config/icloud-for-linux/cookies"
 
-# Conflict handling. "copy" preserves the local version as
-# "<name>.local-conflict-<timestamp>" if the same path changed remotely.
-conflict_mode: "copy"
+# How long cached metadata stays valid before it is re-checked with the
+# remote. Only stale entries are refreshed, so the cost of a refresh pass
+# follows your activity instead of the size of the drive.
+index_ttl_seconds: 300
 
-# Push local changes to iCloud every N seconds.
+# How file content is fetched.
+#   lazy     — download a file the first time it is opened
+#   background — keep eligible files downloaded ahead of time
+hydration: "lazy"
+
+# What happens when a path changed both locally and remotely.
+#   keep-local  — preserve the local version as a blob in the local store
+#   keep-remote — accept the remote version
+conflict_policy: "keep-local"
+
+# Seconds between drain passes (apply the journal to the remote).
 upload_interval_seconds: 30
 
-# Refresh remote metadata from iCloud every N seconds.
+# Seconds between metadata refresh passes.
 remote_refresh_interval_seconds: 300
 
-# Number of warmup workers.
-warmup_workers: 1
+# Run the background loops.
+#   true  — drain and refresh run automatically
+#   false — nothing runs in the background; `icloudctl sync` drives a pass
+auto_sync: true
 
-# Persistent cookie/session directory used after one-time 2FA bootstrap
-cookie_dir: "~/.config/icloud-linux/cookies"
-
-# Paths to exclude from hydration and synchronization (deny-list).
-# exclude_paths:
-#   - /Downloads/Large Archive
-
-# Paths to include in the synchronization boundary (allow-list).
-# Empty/omitted means unrestricted.
+# Allow-list: only these paths may be hydrated or modified.
+# Empty or omitted means unrestricted.
 # sync_paths:
 #   - /Downloads
 
-# Auto-sync mode.
-# true: background upload/refresh loops run automatically.
-# false: run `icloudctl sync` to trigger on-demand refresh.
-auto_sync: true
+# Deny-list: these paths are never hydrated or modified, even when they are
+# inside an allowed path. The deny-list is evaluated first.
+# exclude_paths:
+#   - /Downloads/Large Archive
 
 # FUSE options
 fuse_options:
-  allow_other: false
-  ro: false
-  nonempty: true
+  allow_other: false  # set to true to allow other users to access the mount
+  ro: false           # set to true for read-only access
+  nonempty: true      # allow mounting over a non-empty directory

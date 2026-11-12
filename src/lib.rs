@@ -17,10 +17,12 @@
 #![allow(dead_code)]
 
 pub mod auth;
+pub mod blob;
 pub mod config;
-pub mod fuse_fs;
+pub mod db;
 pub mod icloud_api;
-pub mod mirror;
+pub mod index;
+pub mod journal;
 pub mod service;
-pub mod state;
 pub mod sync;
+pub mod vfs;

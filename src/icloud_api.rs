@@ -1,59 +1,79 @@
+//! The boundary to the iCloud service.
+//!
+//! Everything above this trait (index, journal, blob store, FUSE surface) is
+//! independent of the wire protocol. The implementation that lives behind it
+//! speaks to Apple's iCloud Drive web service and is the piece that is still
+//! being built out — see `docs/ROADMAP.md`.
+//!
+//! The trait is deliberately path-oriented and stateless: the caller asks
+//! about a path, the client resolves it however it can (cache, request, walk)
+//! and answers with the metadata for that path.
+
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Minimal iCloud Drive node metadata used by the sync engine.
-/// This module is intentionally abstracted so the Apple/iCloud HTTP protocol
-/// implementation can evolve independently of the local-first filesystem core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteKind {
+    File,
+    Folder,
+}
+
+/// Metadata of a single remote node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteNode {
     pub path: String,
-    pub node_type: String, // folder | file
-    pub drivewsid: Option<String>,
-    pub docwsid: Option<String>,
+    pub kind: RemoteKind,
+    /// Stable identifier of the node on the server (drivewsid).
+    pub remote_id: Option<String>,
+    /// Version marker of the content, used for conflict detection.
     pub etag: Option<String>,
-    pub zone: Option<String>,
-    pub shareid: Option<String>,
-    pub size: i64,
+    pub size: u64,
     pub mtime: i64,
 }
 
-#[derive(Debug, Clone)]
-pub struct AuthSession {
-    pub cookie_dir: String,
-    pub authenticated: bool,
-}
-
 pub trait ICloudClient: Send + Sync {
+    /// Log in. `interactive` is true when a terminal is available, which
+    /// allows the client to ask for a 2FA code.
     fn authenticate(&mut self, interactive: bool) -> Result<()>;
+
     fn is_authenticated(&self) -> bool;
-    fn list_children_recursive(&self) -> Result<Vec<RemoteNode>>;
-    fn download_file(&self, node: &RemoteNode, dest: &Path) -> Result<()>;
+
+    /// Metadata for a single path. `Ok(None)` means "does not exist".
+    fn stat_node(&self, path: &str) -> Result<Option<RemoteNode>>;
+
+    /// Direct children of a directory.
+    fn list_children(&self, path: &str) -> Result<Vec<RemoteNode>>;
+
+    /// Download the content of a node into `dest`, returning the byte count.
+    fn download_file(&self, node: &RemoteNode, dest: &Path) -> Result<u64>;
+
+    /// Upload a local file below `remote_parent` under `name`.
     fn upload_file(&self, local_path: &Path, remote_parent: &str, name: &str)
         -> Result<RemoteNode>;
+
+    /// Create a directory below `remote_parent`.
     fn mkdir(&self, remote_parent: &str, name: &str) -> Result<RemoteNode>;
-    fn delete(&self, node: &RemoteNode) -> Result<()>;
-    fn rename_move(
-        &self,
-        node: &RemoteNode,
-        new_parent: &str,
-        new_name: &str,
-    ) -> Result<RemoteNode>;
+
+    /// Delete a node by its remote identifier.
+    fn delete(&self, remote_id: &str) -> Result<()>;
+
+    /// Move or rename `source_path` below `remote_parent` under `name`.
+    fn rename_move(&self, source_path: &str, remote_parent: &str, name: &str)
+        -> Result<RemoteNode>;
 }
 
-/// Placeholder client implementation.
+/// Placeholder client used until the protocol implementation lands.
 ///
-/// A full production implementation must handle Apple ID auth, 2FA/2SA, session
-/// cookies/trust tokens, account partitioning, and the iCloud Drive web service
-/// endpoints. This rewrite focuses on the Rust architecture (config, state DB,
-/// mirror, sync orchestration, FUSE integration points) and provides a seam for
-/// plugging in protocol support.
+/// The rest of the system works against the local store, so the filesystem
+/// still mounts and serves cached content; only the remote side is missing.
 pub struct UnimplementedClient;
 
 impl ICloudClient for UnimplementedClient {
     fn authenticate(&mut self, _interactive: bool) -> Result<()> {
         Err(anyhow!(
-            "iCloud API client is not implemented yet. Implement Apple auth/session and Drive API in src/icloud_api.rs"
+            "the iCloud protocol client is not implemented yet (see docs/ROADMAP.md, milestone M1)"
         ))
     }
 
@@ -61,12 +81,16 @@ impl ICloudClient for UnimplementedClient {
         false
     }
 
-    fn list_children_recursive(&self) -> Result<Vec<RemoteNode>> {
-        Err(anyhow!("iCloud Drive listing not implemented"))
+    fn stat_node(&self, _path: &str) -> Result<Option<RemoteNode>> {
+        Err(anyhow!("iCloud stat is not implemented"))
     }
 
-    fn download_file(&self, _node: &RemoteNode, _dest: &Path) -> Result<()> {
-        Err(anyhow!("iCloud download not implemented"))
+    fn list_children(&self, _path: &str) -> Result<Vec<RemoteNode>> {
+        Err(anyhow!("iCloud directory listing is not implemented"))
+    }
+
+    fn download_file(&self, _node: &RemoteNode, _dest: &Path) -> Result<u64> {
+        Err(anyhow!("iCloud download is not implemented"))
     }
 
     fn upload_file(
@@ -75,23 +99,23 @@ impl ICloudClient for UnimplementedClient {
         _remote_parent: &str,
         _name: &str,
     ) -> Result<RemoteNode> {
-        Err(anyhow!("iCloud upload not implemented"))
+        Err(anyhow!("iCloud upload is not implemented"))
     }
 
     fn mkdir(&self, _remote_parent: &str, _name: &str) -> Result<RemoteNode> {
-        Err(anyhow!("iCloud mkdir not implemented"))
+        Err(anyhow!("iCloud mkdir is not implemented"))
     }
 
-    fn delete(&self, _node: &RemoteNode) -> Result<()> {
-        Err(anyhow!("iCloud delete not implemented"))
+    fn delete(&self, _remote_id: &str) -> Result<()> {
+        Err(anyhow!("iCloud delete is not implemented"))
     }
 
     fn rename_move(
         &self,
-        _node: &RemoteNode,
-        _new_parent: &str,
-        _new_name: &str,
+        _source_path: &str,
+        _remote_parent: &str,
+        _name: &str,
     ) -> Result<RemoteNode> {
-        Err(anyhow!("iCloud rename/move not implemented"))
+        Err(anyhow!("iCloud rename is not implemented"))
     }
 }

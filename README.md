@@ -1,52 +1,52 @@
 # icloud-for-linux
 
-Mount iCloud Drive on Linux as a fast, local-first FUSE filesystem — with persistent
-caching, selective hydration, and bidirectional sync.
+Mount iCloud Drive on Linux as a fast, local-first FUSE filesystem — with a
+content-addressed local store, a lazily filled path index, and a journal that
+makes every local change durable and replayable.
 
-This is a **Rust rewrite** of the Python project
-[`IsmaeelAkram/icloud-linux`](https://github.com/IsmaeelAkram/icloud-linux), released
-under the **GNU General Public License v3.0**.
+Independent Rust implementation, released under the **GNU General Public
+License v3.0**.
 
 ---
 
 ## What this is
 
-`icloud-for-linux` makes your iCloud Drive show up like a normal folder on Linux.
+Your iCloud Drive appears as an ordinary folder on Linux, and it behaves like an
+ordinary folder:
 
-It is designed to feel much more local than a naive network mount:
-
-- folders and filenames are cached on disk
-- file contents are downloaded into a local mirror on demand or in the background
-- reads usually come from local storage, not from iCloud on every access
-- local changes are written immediately and synced back on the next sync pass
-- remote changes are pulled in by the sync engine on demand or on a timer
-
-In practice, `find`, editors, shells and normal file browsing work against a persistent
-local cache instead of blocking on iCloud for every operation.
+- `find`, editors, shells and file browsers work against a local store
+- reads are served from disk, never from the network
+- writes are recorded in a journal before they are uploaded
+- remote changes are pulled in when they matter, not on a full rescan
 
 ## How it works
 
-Three main pieces:
+Three cooperating parts:
 
-| Piece | What it does |
+| Part | What it does |
 | --- | --- |
-| **Metadata crawl** | First run scans iCloud Drive and builds a local index (SQLite). |
-| **Hydration** | File contents are downloaded into the local mirror — lazily on open, or proactively in the background. |
-| **Sync engine** | Local edits upload and remote changes refresh, automatically on a timer or on demand via `icloudctl sync`. |
+| **Content store** | Every file's content is stored once, keyed by its SHA-256. Duplicates cost nothing, corruption is detectable. |
+| **Path index** | A lazily filled SQLite index of paths and their metadata. Nothing is scanned up front; a path is resolved when you touch it. |
+| **Journal** | A write-ahead log of local changes. Idempotent, ordered, and replayable after a crash. |
+
+On top of those sits the FUSE filesystem, which serves reads from the local
+store and turns writes into journal entries.
 
 Important behaviour:
 
-- The mount is local-first.
-- Restarts reuse the existing cache instead of starting from zero.
-- Opening a file before it finished hydrating downloads that file first, then serves it locally.
-- Failed warmup downloads are retried automatically with backoff.
-- If a path changed both locally and remotely, the local version is preserved as a conflict copy instead of being silently overwritten.
-- With `auto_sync: false` the driver starts and mounts immediately without spawning background polling threads. Run `icloudctl sync` when you want a fresh pull.
+- The mount is local-first; opening a file never blocks on a download unless
+  the content has never been fetched.
+- Restarts reuse the existing store.
+- A file is never half-written: the kernel sees complete content only.
+- If a path changed both locally and remotely, the local version is **kept** as a
+  blob in the store and recorded as a conflict — nothing is overwritten silently.
+- With `auto_sync: false` nothing polls in the background; `icloudctl sync`
+  drives a single pass when you want one.
 
 ## Requirements
 
 - Linux with FUSE (`/dev/fuse`)
-- Rust 1.85+ to build from source (or use the prebuilt container image)
+- Rust 1.85+ to build from source, or use the container image
 - `systemctl --user` for the background service
 
 ### Debian / Ubuntu
@@ -63,8 +63,8 @@ sudo dnf install fuse gcc make
 ```
 
 The FUSE layer is pure Rust — it talks to `/dev/fuse` directly, so no `libfuse`
-development headers are required. `build-essential` is only needed for the bundled
-SQLite build.
+development headers are needed. `build-essential` is only required for the
+bundled SQLite build.
 
 ## Install
 
@@ -82,56 +82,58 @@ make install          # installs ~/.local/bin/icloudctl
 docker compose --profile fuse up --build mount
 ```
 
-### Prebuilt release tarball
+### Release tarball
 
 ```bash
-curl -LO https://github.com/einyx/icloud-for-linux/releases/latest/download/icloud-for-linux-linux-x86_64.tar.gz
-tar -xzf icloud-for-linux-linux-x86_64.tar.gz
-sudo install -m755 icloudctl /usr/local/bin/icloudctl
+curl -LO https://github.com/einyx/icloud-for-linux/releases/latest/download/icloud-for-linux-0.2.0-linux-x86_64.tar.gz
+tar -xzf icloud-for-linux-0.2.0-linux-x86_64.tar.gz
+sudo install -m755 icloud-for-linux-0.2.0/icloudctl /usr/local/bin/icloudctl
 ```
 
 ## Quick setup
 
 ```bash
-icloudctl init ~/iCloud      # config + cache dirs + systemd user unit
+icloudctl init ~/iCloud      # store, config and systemd user unit
 icloudctl configure          # Apple ID email + password
 icloudctl auth               # interactive 2FA bootstrap
 icloudctl mount ~/iCloud     # mount it
 ```
 
-`icloudctl init` writes a systemd user unit, so `systemctl --user start icloud.service`
-runs the same mount in the background afterwards.
+`icloudctl init` writes a systemd user unit, so `systemctl --user start
+icloud-for-linux.service` runs the same mount in the background afterwards.
 
 ## Everyday commands
 
 | Command | What it does |
 | --- | --- |
-| `icloudctl init [dir]` | Create config/cache dirs, config file and the systemd user unit |
+| `icloudctl init [dir]` | Create the local store, the config file and the systemd unit |
 | `icloudctl configure [email]` | Write `config.yaml` with credentials |
 | `icloudctl auth` | Interactive Apple ID + 2FA bootstrap |
 | `icloudctl mount [dir]` | Mount the filesystem (foreground) |
 | `icloudctl unmount [dir]` | Unmount the filesystem |
-| `icloudctl hydrate [--dry-run] [--verbose]` | Download all eligible files into the local mirror |
-| `icloudctl sync [--timeout SEC] [--quiet]` | Trigger an on-demand remote sync in the running driver |
+| `icloudctl sync [--dry-run]` | Drain the journal and refresh stale metadata |
+| `icloudctl hydrate [--dry-run]` | Download the content of every eligible file |
+| `icloudctl export <path> <dir>` | Materialise a subtree as plain files |
+| `icloudctl verify` | Re-hash every blob and report corruption |
+| `icloudctl gc` | Remove blobs nothing references any more |
+| `icloudctl index` | Show what the local index knows |
 | `icloudctl status` | Show service status |
 | `icloudctl logs` | Tail service logs |
-| `icloudctl doctor` | Check local setup health |
-| `icloudctl clear-cache` | Remove the local mirror and state DB (rebuilt on next start) |
+| `icloudctl doctor` | Check the local setup |
+| `icloudctl clear-cache` | Remove the local store (rebuilt on next start) |
 
 ### Why authentication is split into two steps
 
 Systemd user services are non-interactive — they cannot pause for a 2FA code.
 
-So the project uses:
-
-- `icloudctl auth` for the interactive one-time Apple login and 2FA flow
-- a generated user service that reuses the saved session in the background
+- `icloudctl auth` performs the interactive one-time Apple login and 2FA flow
+- the generated user service reuses the saved session in the background
 
 If Apple expires your session:
 
 ```bash
 icloudctl auth
-systemctl --user restart icloud.service
+systemctl --user restart icloud-for-linux.service
 ```
 
 If Apple reports that updated terms of service must be accepted:
@@ -142,30 +144,31 @@ icloudctl auth --accept-terms
 
 ### iOS 26 beta 2FA workaround
 
-iOS 26 beta may deliver a push notification popup instead of a numeric code. Force an
-SMS code instead:
+iOS 26 beta may deliver a push notification popup instead of a numeric code.
+Force an SMS code instead:
 
 ```bash
 icloudctl auth --force-sms
 ```
 
-`icloudctl auth --debug` prints Apple's reported auth mode to diagnose delivery issues.
+`icloudctl auth --debug` prints Apple's reported auth mode to diagnose delivery
+issues.
 
 ## Controlling the synchronisation boundary
 
-By default the whole drive is indexed (stubs everywhere) and the mount permits
-mutations throughout. `sync_paths` makes selective sync a hard boundary.
+By default the whole drive is reachable and the mount permits mutations
+throughout. `sync_paths` makes selective sync a hard boundary.
 
-**`sync_paths`** — allow-list. Only paths in this list have file contents downloaded, or
-may be created, written, truncated, renamed, moved or deleted through the mount.
-Operations outside the allow-list fail with `EACCES` and are never queued for upload.
-Empty or omitted means unrestricted.
+**`sync_paths`** — allow-list. Only paths in this list may be downloaded or
+modified through the mount. Anything else fails with `EACCES` and is never
+queued for upload. Empty or omitted means unrestricted.
 
-**`exclude_paths`** — deny-list. Matching paths are never hydrated or mutated, even if
-they fall under a `sync_path`. The deny-list is evaluated first.
+**`exclude_paths`** — deny-list. Matching paths are never downloaded or
+modified, even if they fall under a `sync_path`. The deny-list is evaluated
+first.
 
 ```yaml
-# Only hydrate /Downloads
+# Only download /Downloads
 sync_paths:
   - /Downloads
 
@@ -178,30 +181,30 @@ For a rename or move, **both** the source and the destination must be permitted.
 
 ## Auto-sync vs on-demand sync
 
-**`auto_sync: true`** (default) — background loops poll iCloud on the
-`upload_interval_seconds` and `remote_refresh_interval_seconds` schedules.
+**`auto_sync: true`** (default) — the drain and refresh loops run automatically.
 
-**`auto_sync: false`** — no polling threads start. The driver mounts and waits. Use
-`icloudctl sync` to pull the latest remote changes when you need them.
+**`auto_sync: false`** — nothing runs in the background. The driver mounts and
+waits; `icloudctl sync` runs a single pass when you want one.
 
 ```bash
-icloudctl sync          # pull latest metadata from iCloud
-icloudctl hydrate       # download file contents for all eligible paths
-# now copy from the mirror: ~/.cache/icloud-linux/mirror/Downloads/
+icloudctl sync          # apply pending changes, refresh stale metadata
+icloudctl hydrate       # download the content of every eligible file
+icloudctl export /Downloads ~/Desktop/intake   # copy out as plain files
 ```
 
-## Local cache and sync state
+## Local store layout
 
 | What | Where |
 | --- | --- |
-| Config | `~/.config/icloud-linux/config.yaml` |
-| Session cookies | `~/.config/icloud-linux/cookies` |
-| Service env | `~/.config/icloud-linux/icloud.env` |
-| User service | `~/.config/systemd/user/icloud.service` |
-| Local cache root | `~/.cache/icloud-linux` |
-| Local mirror | `~/.cache/icloud-linux/mirror` |
-| Sync state database | `~/.cache/icloud-linux/state.sqlite3` |
-| Logs | `~/.local/state/icloud-linux/icloud.log` |
+| Config | `~/.config/icloud-for-linux/config.yaml` |
+| Session cookies | `~/.config/icloud-for-linux/cookies` |
+| Service env | `~/.config/icloud-for-linux/icloud.env` |
+| User service | `~/.config/systemd/user/icloud-for-linux.service` |
+| Store root | `~/.cache/icloud-for-linux` |
+| Content store | `~/.cache/icloud-for-linux/blobs/ab/cdef…` |
+| Working copies | `~/.cache/icloud-for-linux/staging/*.work` |
+| Index + journal | `~/.cache/icloud-for-linux/state.sqlite3` |
+| Logs | `~/.local/state/icloud-for-linux/icloud.log` |
 
 ## Development harness
 
@@ -209,10 +212,10 @@ The repo ships a complete dev harness so you never need a local Rust install:
 
 ```bash
 make check         # fmt + clippy + tests on the host
-make docker-dev   # shell inside the dev container
-make docker-check # fmt + clippy + tests inside the dev container
-make docker-fuse  # run the FUSE mount inside a container (needs /dev/fuse)
-make help         # all targets
+make docker-dev    # shell inside the dev container
+make docker-check  # fmt + clippy + tests inside the dev container
+make docker-fuse   # run the FUSE mount inside a container (needs /dev/fuse)
+make help          # all targets
 ```
 
 Layout:
@@ -231,19 +234,19 @@ Layout:
 ```bash
 icloudctl status
 icloudctl doctor
-journalctl --user -u icloud.service -f
+journalctl --user -u icloud-for-linux.service -f
 ```
 
 **Authentication expired**
 
 ```bash
 icloudctl auth
-systemctl --user restart icloud.service
+systemctl --user restart icloud-for-linux.service
 ```
 
-**Service starts but auth fails silently** — under systemd there is no TTY, so a failed
-auth parks the service in unauthenticated mode instead of crash-looping (this avoids
-Apple account lockout). You will see `UNAUTHENTICATED mode` in the logs.
+**Service starts but auth fails silently** — under systemd there is no TTY, so a
+failed auth parks the service in unauthenticated mode instead of crash-looping
+(this avoids Apple account lockout). You will see the warning in the logs.
 
 **Rebuild everything locally**
 
@@ -251,39 +254,45 @@ Apple account lockout). You will see `UNAUTHENTICATED mode` in the logs.
 icloudctl clear-cache
 ```
 
+**Check what is stored locally**
+
+```bash
+icloudctl index
+icloudctl verify
+```
+
 ## Project status
 
-This is an active rewrite. The local-first core (config, SQLite state, mirror, FUSE
-surface, CLI, service integration) is implemented and tested; the Apple/iCloud
-protocol client is being ported. See [docs/ROADMAP.md](docs/ROADMAP.md) for the
-current status and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the module map.
+This is an active implementation. The local store — content store, path index,
+journal, FUSE surface, CLI, service integration — is implemented and tested. The
+Apple protocol client is the piece still being built. See
+[docs/ROADMAP.md](docs/ROADMAP.md) for the status and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
 
 ## License & attribution
 
 Copyright (C) 2026 einyx and contributors.
 
-This program is free software: you can redistribute it and/or modify it under the
-terms of the **GNU General Public License as published by the Free Software Foundation,
-either version 3 of the License, or (at your option) any later version.**
+This program is free software: you can redistribute it and/or modify it under
+the terms of the **GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.**
 
 This program is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
 PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
-You should have received a copy of the GNU General Public License along with this
-program. If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <https://www.gnu.org/licenses/>.
 
-### Upstream project
+### Provenance
 
-This work is a rewrite of, and is inspired by, the Python project
+This is an **independent implementation**. It was written from scratch in Rust;
+no source code from another project is included. The goal it pursues — a
+local-first iCloud Drive filesystem for Linux — comes from the community project
 [`IsmaeelAkram/icloud-linux`](https://github.com/IsmaeelAkram/icloud-linux) by
-Ismaeel Akram. The upstream repository ships **no license file**, which means it is
-not licensed as open source by default.
-
-> **Before distributing this rewrite, resolve upstream licensing.** Either obtain an
-> explicit license grant from the upstream author, or confirm that the Rust
-> implementation is a clean-room, independent work that does not reproduce upstream
-> code. See [docs/ROADMAP.md](docs/ROADMAP.md#legal-risk) for the checklist.
+Ismaeel Akram, which is credited here for the idea and for proving the idea
+works. That project ships no license file, so nothing from it is reused here.
 
 Apple, iCloud, macOS and iOS are trademarks of Apple Inc. This project is not
 affiliated with, endorsed by, or sponsored by Apple Inc.

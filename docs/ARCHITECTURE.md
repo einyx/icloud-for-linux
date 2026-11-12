@@ -1,93 +1,150 @@
 # Architecture
 
-A Rust port of the Python `icloud-linux` FUSE driver. The design keeps the same
-mental model — *local-first, persistent cache, sync engine on top* — while moving
-the concurrency model from threads + `ThreadPoolExecutor` to explicit state machine +
-worker pool.
+`icloud-for-linux` is an independent Rust implementation of an iCloud Drive
+filesystem for Linux. This document describes the design and, for every
+subsystem, why it looks the way it does.
 
-## Module map
+## Design goals
 
-| Rust module | Python original | Responsibility |
+1. **Local-first.** Reads must never wait for the network. Everything the user
+   touches is available locally.
+2. **No full crawl.** The upstream Python driver scans the entire drive before
+   it mounts. On a large drive that costs minutes, a lot of memory and a lot of
+   API calls — to build an index the user mostly never reads. Here the index is
+   filled on demand, and refreshes are proportional to activity.
+3. **Content is addressed, not paths.** Storing one copy per path wastes space
+   and makes integrity checks impossible. Content is stored once, keyed by its
+   hash.
+4. **Every local mutation is recorded before it is applied.** A crash must
+   never lose a change, and replaying the log must never apply a change twice.
+5. **A conflict must not destroy data.** The losing version of a diverged path
+   is kept, not overwritten.
+
+## Layers
+
+```
+                    kernel VFS
+                        │
+                ┌───────▼────────┐
+                │  VFS (fuser)   │  src/vfs.rs
+                └───────┬────────┘
+                        │
+        ┌───────────────┼────────────────┐
+        │               │                │
+┌───────▼──────┐ ┌──────▼───────┐ ┌──────▼──────┐
+│ working copy │ │ path index   │ │  journal    │
+│ (staging/)   │ │ (SQLite)     │ │ (SQLite)    │
+└───────┬──────┘ └──────┬───────┘ └──────┬──────┘
+        │               │                │
+        └───────────────┼────────────────┘
+                        │
+              ┌─────────▼─────────┐
+              │  blob store (CAS) │  src/blob.rs
+              └─────────┬─────────┘
+                        │
+              ┌─────────▼─────────┐
+              │  iCloud client    │  src/icloud_api.rs
+              └───────────────────┘
+```
+
+### Working copy and content store
+
+The two layers of local state mirror how a version control system works:
+
+| Layer | Where | Purpose |
 | --- | --- | --- |
-| `src/config.rs` | `config.example.yaml` handling | Config parsing (YAML), path normalisation, sync boundary rules |
-| `src/state.rs` | `driver.py` → `SyncState` | SQLite state DB: entries, pending ops, dirty/tombstone tracking |
-| `src/mirror.rs` | `driver.py` → `LocalMirror` | Local content mirror: atomic writes, placeholders, hashing |
-| `src/icloud_api.rs` | `pyicloud` dependency | Trait boundary for the Apple/iCloud protocol client |
-| `src/sync.rs` | `driver.py` → `ICloudSyncEngine` | Crawl, hydrate, upload, conflict resolution, background loops |
-| `src/fuse_fs.rs` | `driver.py` → `Operations` (fusepy) | FUSE operations surface (lookup, readdir, read/write, rename, …) |
-| `src/auth.rs` | `auth.py` | Interactive Apple ID / 2FA bootstrap |
-| `src/service.rs` | `icloudctl` (bash) | systemd unit generation, env file, service control helpers |
-| `src/main.rs` | `icloudctl` (bash) | CLI surface |
+| **Working copy** | `staging/<hash>.work` | The file the kernel reads and writes. One file per path, always complete. |
+| **Content store** | `blobs/ab/cdef…` | The content of every committed file, keyed by its SHA-256. Deduplicated, verifiable. |
 
-## Data flow
+A write goes to the working copy. When the file is flushed, the working copy is
+hashed and committed to the content store, the index is updated with the new
+digest and size, and the change is recorded in the journal.
 
-```
-              ┌─────────────┐        crawl / upload / download
-              │  iCloud API │◄──────────────────────────────┐
-              └─────────────┘                               │
-                     │                                     │
-              ┌──────▼──────┐   metadata   ┌─────────────┐ │
-              │ SyncEngine  │─────────────►│ SyncState   │ │
-              │             │◄─────────────│ (SQLite)    │ │
-              └──────┬──────┘  dirty/hydrated└─────────────┘ │
-                     │                                     │
-              ┌──────▼──────┐                              │
-              │ LocalMirror │  content                     │
-              └──────┬──────┘                              │
-                     │                                     │
-              ┌──────▼─────────────────────────────────────▼┐
-              │  ICloudFs (fuser)  ──►  kernel VFS          │
-              └──────────────────────────────────────────────┘
-```
+Consequences:
 
-Reads are served from `LocalMirror`. When a file is not hydrated yet, the FUSE
-`open`/`read` path calls back into `SyncEngine::ensure_local_file`, which downloads
-the content first and then serves it locally — the same "download then serve"
-behaviour the Python driver had.
+- The kernel never sees a partially written file.
+- The same content at two paths is stored once.
+- `icloudctl verify` can re-hash every blob and detect corruption.
+- The remote only ever receives complete, hashed content.
 
-## State DB
+### Path index
 
-Schema is intentionally compatible with the Python implementation's
-`~/.cache/icloud-linux/state.sqlite3`:
+`src/index.rs` — a table of `path → metadata`, filled lazily.
 
-```sql
-entries(
-  path PRIMARY KEY, type, parent_path,
-  remote_drivewsid, remote_docwsid, remote_etag, remote_zone, remote_shareid,
-  size, mtime, hydrated, dirty, tombstone,
-  local_sha256, last_synced_at, synced_path
-)
-pending_ops(id, op, path, target_path, queued_at, retry_count, last_error)
-```
+| Column | Meaning |
+| --- | --- |
+| `path`, `parent` | Location in the drive |
+| `kind` | `file` or `folder` |
+| `size`, `mtime`, `etag`, `remote_id` | Remote metadata |
+| `digest`, `hydrated` | Local content state |
+| `dirty` | Local change not yet uploaded |
+| `present` | Deleted locally, awaiting upload |
+| `fetched_at` | When the entry was last validated against the remote |
 
-Keeping the schema compatible means an existing cache can be reused by the Rust
-build and vice versa, which makes migration and A/B testing painless.
+`fetched_at` is what makes the refresh a *delta* refresh: the sync engine asks
+the remote only about the entries that are older than `index_ttl_seconds`,
+instead of walking the whole drive again. A path that was never touched never
+costs anything.
 
-## Sync boundary rules
+### Journal
 
-Two rules, evaluated in this order, shared by the FUSE layer, the hydrator and the
-uploader (single source of truth, `config::path_allowed`):
+`src/journal.rs` — a write-ahead log of local mutations.
+
+| Property | How it is achieved |
+| --- | --- |
+| Durability | The operation is written before the change is queued for upload. |
+| Idempotency | Every operation has a key (`op:path:target:digest`). Replaying it cannot duplicate work. |
+| Ordering | Content operations are applied before the rename or delete that depends on them. |
+| Convergence | A newer content version supersedes the pending older ones for the same path. |
+| History | Conflicts are recorded with the digest of the version that lost. |
+
+### Sync engine
+
+`src/sync.rs` — two loops that can also be driven manually.
+
+* **Drain** takes the pending operations and applies them to the remote:
+  upload the blob, create the directory, delete the node, move the node. A
+  failure marks the operation as failed and leaves it in the journal for the
+  next pass.
+* **Refresh** re-validates the metadata that went stale. When an entry changed
+  remotely *and* changed locally, the local version is preserved as a blob and
+  recorded as a conflict — the remote version stays authoritative for the path.
+
+### The remote boundary
+
+`src/icloud_api.rs` defines a path-oriented trait (`stat_node`, `list_children`,
+`download_file`, `upload_file`, `mkdir`, `delete`, `rename_move`). Nothing above
+that trait knows about HTTP, cookies or 2FA, and nothing above it changes when
+the protocol implementation does.
+
+## Concurrency
+
+- The FUSE session runs on its own thread.
+- The index and the journal share one SQLite connection behind a mutex, in WAL
+  mode, so the sync workers never block the kernel path for long.
+- The blob store is lock-free: blobs are immutable and named by their digest.
+  Writers stage into `staging/` and rename into place, so a reader can never
+  observe a partial blob.
+
+## The synchronisation boundary
+
+Two rules, evaluated in this order, shared by the VFS, the hydrator and the
+uploader (`config::path_allowed`):
 
 1. `exclude_paths` (deny-list) — a matching prefix blocks hydration and mutation.
 2. `sync_paths` (allow-list) — when set, only matching prefixes are hydrated or mutable.
 
-`config::resolve_icloud_path` refuses paths that try to climb above the drive root,
-and `mirror::LocalMirror::local_path` re-checks containment on the resolved path.
+`config::resolve_icloud_path` refuses paths that try to climb above the drive
+root.
 
-## Threading model
+## Provenance
 
-- The FUSE session owns one thread (the `fuser` session loop).
-- The sync engine owns a bounded worker pool for downloads/uploads.
-- Background loops (upload timer, remote refresh timer) run as cancellable tasks and
-  are signalled through an atomic "refresh requested" flag plus `SIGUSR1` for the
-  on-demand path.
+This is an independent implementation. The design decisions above were taken
+from first principles (and from how git, rsync, restic and Syncthing solve the
+same problems), not transcribed from another codebase. The protocol client that
+will sit behind `ICloudClient` is written against Apple's public web service
+behaviour.
 
-`SIGUSR1` keeps the upstream contract: `icloudctl sync` signals the running driver
-and waits for the completion marker in `~/.local/state/icloud-linux/sync_done`.
-
-## Extension points
-
-- `icloud_api::ICloudClient` — implement this trait to plug in a real protocol
-  client (or a mock for tests).
-- `fuse_fs::HydrateFn` — the callback used to hydrate on demand; lets tests mount a
-  filesystem with a fake hydrator.
+The upstream Python project that inspired the goal — a local-first iCloud Drive
+filesystem for Linux — is credited in `README.md` and `NOTICE`. No upstream
+source code is included in this repository.

@@ -1,24 +1,26 @@
+//! Integration with systemd and the on-disk layout of the local store.
+
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-pub const SERVICE_NAME: &str = "icloud.service";
+pub const SERVICE_NAME: &str = "icloud-for-linux.service";
 
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("icloud-linux")
+        .join("icloud-for-linux")
 }
 
 pub fn state_dir() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| PathBuf::from("~/.local/state"))
-        .join("icloud-linux")
+        .join("icloud-for-linux")
 }
 
 pub fn cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("~/.cache"))
-        .join("icloud-linux")
+        .join("icloud-for-linux")
 }
 
 pub fn config_file() -> PathBuf {
@@ -42,12 +44,8 @@ pub fn log_file() -> PathBuf {
 }
 
 pub fn ensure_dirs() -> Result<()> {
-    for d in [
-        config_dir(),
-        state_dir(),
-        cache_dir(),
-        service_file().parent().unwrap().to_path_buf(),
-    ] {
+    let unit_dir = service_file().parent().unwrap().to_path_buf();
+    for d in [config_dir(), state_dir(), cache_dir(), unit_dir] {
         std::fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
     }
     Ok(())
@@ -146,7 +144,7 @@ pub fn write_config(
     cookie: &Path,
 ) -> Result<()> {
     let contents = format!(
-        "username: \"{}\"\npassword: \"{}\"\ncache_dir: \"{}\"\ncookie_dir: \"{}\"\nwarmup_mode: \"background\"\nconflict_mode: \"copy\"\nupload_interval_seconds: 30\nremote_refresh_interval_seconds: 300\nwarmup_workers: 1\nauto_sync: true\nfuse_options:\n  allow_other: false\n  ro: false\n  nonempty: true\n",
+        "username: \"{}\"\npassword: \"{}\"\ncache_dir: \"{}\"\ncookie_dir: \"{}\"\nindex_ttl_seconds: 300\nhydration: \"lazy\"\nconflict_policy: \"keep-local\"\nupload_interval_seconds: 30\nremote_refresh_interval_seconds: 300\nauto_sync: true\nfuse_options:\n  allow_other: false\n  ro: false\n  nonempty: true\n",
         username.replace('"', "\\\""),
         password.replace('"', "\\\""),
         cache.display(),
@@ -166,7 +164,10 @@ pub fn systemctl(args: &[&str]) -> Result<std::process::Output> {
 }
 
 pub fn service_is_active() -> bool {
-    matches!(systemctl(&["is-active", "--quiet", SERVICE_NAME]), Ok(out) if out.status.success())
+    matches!(
+        systemctl(&["is-active", "--quiet", SERVICE_NAME]),
+        Ok(out) if out.status.success()
+    )
 }
 
 pub fn service_main_pid() -> Option<u32> {

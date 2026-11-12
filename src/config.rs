@@ -1,3 +1,10 @@
+//! Configuration.
+//!
+//! The options describe *when* and *what* the client synchronises. They
+//! deliberately differ from the upstream Python project: there is no full
+//! crawl, so there is no "warmup" phase to configure, and conflicts are kept
+//! as blobs instead of being copied next to the original file.
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -23,18 +30,32 @@ impl Default for FuseOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Apple ID.
     pub username: String,
+    /// Apple ID password.
     pub password: String,
+    /// Root of the local store (blobs, staging, index, journal).
     pub cache_dir: String,
-    pub warmup_mode: String,
-    pub conflict_mode: String,
-    pub upload_interval_seconds: u64,
-    pub remote_refresh_interval_seconds: u64,
-    pub warmup_workers: usize,
+    /// Where the session cookies are kept.
     pub cookie_dir: String,
-    pub exclude_paths: Vec<String>,
-    pub sync_paths: Option<Vec<String>>,
+    /// How long cached metadata stays valid before it is re-checked.
+    pub index_ttl_seconds: u64,
+    /// `lazy` downloads a file when it is opened, `background` downloads
+    /// eligible files ahead of time.
+    pub hydration: String,
+    /// `keep-local` preserves the local version of a diverged path as a blob,
+    /// `keep-remote` accepts the remote version.
+    pub conflict_policy: String,
+    /// Seconds between drain passes.
+    pub upload_interval_seconds: u64,
+    /// Seconds between metadata refresh passes.
+    pub remote_refresh_interval_seconds: u64,
+    /// Run the background loops. When false, `icloudctl sync` drives them.
     pub auto_sync: bool,
+    /// Allow-list of paths that may be hydrated or mutated.
+    pub sync_paths: Option<Vec<String>>,
+    /// Deny-list, evaluated before the allow-list.
+    pub exclude_paths: Vec<String>,
     pub fuse_options: FuseOptions,
 }
 
@@ -43,16 +64,16 @@ impl Default for Config {
         Self {
             username: String::new(),
             password: String::new(),
-            cache_dir: "~/.cache/icloud-linux".to_string(),
-            warmup_mode: "background".to_string(),
-            conflict_mode: "copy".to_string(),
+            cache_dir: "~/.cache/icloud-for-linux".to_string(),
+            cookie_dir: "~/.config/icloud-for-linux/cookies".to_string(),
+            index_ttl_seconds: 300,
+            hydration: "lazy".to_string(),
+            conflict_policy: "keep-local".to_string(),
             upload_interval_seconds: 30,
             remote_refresh_interval_seconds: 300,
-            warmup_workers: 1,
-            cookie_dir: "~/.config/icloud-linux/cookies".to_string(),
-            exclude_paths: Vec::new(),
-            sync_paths: None,
             auto_sync: true,
+            sync_paths: None,
+            exclude_paths: Vec::new(),
             fuse_options: FuseOptions::default(),
         }
     }
@@ -73,12 +94,17 @@ impl Config {
     pub fn expanded_cookie_dir(&self) -> PathBuf {
         expand_path(&self.cookie_dir)
     }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.expanded_cache_dir().join("state.sqlite3")
+    }
 }
 
 pub fn expand_path(s: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(s).to_string())
 }
 
+/// Normalise a path to an absolute, canonical iCloud path.
 pub fn normalize_icloud_path(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for segment in path.split('/') {
@@ -97,14 +123,7 @@ pub fn normalize_icloud_path(path: &str) -> String {
     }
 }
 
-pub fn normalize_paths(paths: &[String]) -> Vec<String> {
-    paths.iter().map(|p| normalize_icloud_path(p)).collect()
-}
-
-/// Resolve a path and refuse anything that tries to climb above the drive root.
-///
-/// Used by the mirror before touching the filesystem so a crafted path can
-/// never escape the cache directory.
+/// Resolve a path and refuse anything that climbs above the drive root.
 pub fn resolve_icloud_path(path: &str) -> Result<String> {
     let mut parts: Vec<&str> = Vec::new();
     for segment in path.split('/') {
@@ -125,6 +144,11 @@ pub fn resolve_icloud_path(path: &str) -> Result<String> {
     }
 }
 
+pub fn normalize_paths(paths: &[String]) -> Vec<String> {
+    paths.iter().map(|p| normalize_icloud_path(p)).collect()
+}
+
+/// The synchronisation boundary: deny-list first, then allow-list.
 pub fn path_allowed(path: &str, sync_paths: Option<&[String]>, exclude_paths: &[String]) -> bool {
     let path = normalize_icloud_path(path);
     let excludes = normalize_paths(exclude_paths);

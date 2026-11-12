@@ -1,91 +1,101 @@
 # Roadmap
 
-Strategy for shipping `icloud-for-linux` as a credible, license-clean Rust
-successor to the Python `icloud-linux` project.
+Status and plan for `icloud-for-linux`.
 
 ## Where we are
 
 | Area | Status | Notes |
 | --- | --- | --- |
 | Project scaffold, CI, dev harness | ✅ Done | Makefile, Dockerfile, compose, devcontainer, GitHub Actions |
-| License (GPLv3) + NOTICE + attribution | ✅ Done | See `LICENSE`, `NOTICE` |
-| Config model + sync boundary rules | ✅ Done | `src/config.rs`, unit tested |
-| SQLite state DB | ✅ Done | `src/state.rs`, schema-compatible with upstream |
-| Local mirror (atomic writes, placeholders, hashing) | ✅ Done | `src/mirror.rs`, unit tested |
-| FUSE surface (fuser) | ✅ Done | `src/fuse_fs.rs` — lookup/readdir/read/write/create/mkdir/rename/rmdir/unlink/setattr |
-| CLI (`icloudctl`) | ✅ Done | `src/main.rs` — init/configure/auth/mount/unmount/hydrate/sync/status/logs/doctor/clear-cache |
+| License (GPLv3) + NOTICE + provenance | ✅ Done | See `LICENSE`, `NOTICE` |
+| Content-addressed blob store | ✅ Done | `src/blob.rs` — dedup, atomic commit, integrity check, GC |
+| Lazy path index | ✅ Done | `src/index.rs` — TTL-based staleness, subtree moves, no full crawl |
+| Write-ahead journal | ✅ Done | `src/journal.rs` — idempotent, ordered, supersedes older versions |
+| FUSE surface | ✅ Done | `src/vfs.rs` — working copy + content store, staged writes, tombstones |
+| Sync engine (drain + delta refresh) | ✅ Done | `src/sync.rs` — journal drain, stale-only refresh, conflict capture |
+| CLI (`icloudctl`) | ✅ Done | 15 subcommands including `verify`, `gc`, `export`, `index` |
 | systemd user unit generation | ✅ Done | `src/service.rs` |
-| Apple/iCloud protocol client | 🔲 **Next** | `src/icloud_api.rs` — trait defined, implementation pending |
+| Apple protocol client | 🔲 **Next** | `src/icloud_api.rs` — trait defined, implementation pending |
 | Interactive 2FA bootstrap | 🔲 Next | `src/auth.rs` — flow defined, protocol pending |
-| Background upload/refresh loops | 🔲 Next | `src/sync.rs` — engine skeleton present, loops pending |
-| Conflict resolution (`copy` mode) | 🔲 Next | depends on the protocol client |
-| Upstream parity test suite | 🔲 Next | port `test_driver.py` / `test_hydrate.py` scenarios to Rust |
+| Background drain/refresh loops | 🔲 Next | engine present, the timers land with the client |
+| Conflict resolution end to end | 🔲 Next | capture is implemented, remote side needs the client |
 
 ## Milestones
 
 ### M1 — Protocol client (blocking)
+
 Deliver a working `ICloudClient` implementation:
 
 - Apple ID login + 2FA/2SA (push, trusted-device bridge, SMS fallback)
 - account partition detection (`x-apple-user-partition`) to avoid `421` errors
 - session/trust cookie persistence in `cookie_dir`
-- Drive metadata crawl (`drivewsid`, `docwsid`, `etag`, `zone`, `shareid`)
+- Drive metadata resolution by path (`stat_node`, `list_children`)
 - file download / upload / mkdir / delete / move+rename
 - updated terms-of-service acceptance
 
-**Exit criteria:** a real iCloud account can be crawled, hydrated, and written back.
+**Exit criteria:** a real iCloud account can be browsed, downloaded, and written
+back, with the index filling lazily and the journal draining.
 
-### M2 — Sync engine
-- background upload timer + remote refresh timer
-- `auto_sync: false` on-demand path (`SIGUSR1` → crawl → `sync_done` marker)
-- dirty/tombstone tracking with conflict copies (`<name>.local-conflict-<ts>`)
-- retry with exponential backoff for failed downloads
+### M2 — Background loops and conflicts
+
+- drain and refresh timers driven by `upload_interval_seconds` /
+  `remote_refresh_interval_seconds`
+- `auto_sync: false` on-demand path (`SIGUSR1` → one pass → completion marker)
+- conflict blob export (`icloudctl export-conflicts`)
 - selective hydration honouring `sync_paths` / `exclude_paths`
-
-**Exit criteria:** bidirectional sync works across restarts without data loss.
+- background hydration mode (prefetch eligible files)
 
 ### M3 — Parity & hardening
-- port the upstream Python test scenarios to Rust integration tests
+
+- port the upstream behaviour scenarios to Rust integration tests
 - memory ceiling check (the Python driver had a 4-minute / 11 GB boot blowup)
-- crash-safety: atomic mirror writes, WAL-mode SQLite
-- FUSE edge cases: `fsync`, `fallocate`, xattrs, `renameat2`, large files > 4 GB
+- crash safety: atomic working-copy writes, WAL SQLite, blob integrity sweep
+- FUSE edge cases: `fallocate`, xattrs, `renameat2`, files > 4 GB, `fsync`
+  ordering
 
 ### M4 — Distribution
+
 - release tarballs + container images (already wired in CI)
 - AUR / Nix flake packaging
-- `icloudctl doctor` covering kernel FUSE version, `/dev/fuse` perms, clock skew
+- `icloudctl doctor` covering kernel FUSE version, `/dev/fuse` permissions,
+  clock skew
 
-## Legal risk
+## Design decisions to revisit
 
-The upstream Python repository (`IsmaeelAkram/icloud-linux`) ships **no LICENSE
-file**. Unlicensed code is "All rights reserved" by default, so a rewrite that
-reproduces upstream logic, structure or code cannot be redistributed until the
-author grants a license.
+| Decision | Alternative | When to reconsider |
+| --- | --- | --- |
+| Working copy per path in `staging/` | Read-only mount backed by the blob store only | If the working copy duplicates too much data — a hardlink into the blob store could replace it, at the cost of losing the "always complete file" guarantee |
+| One SQLite file for index and journal | Separate files | If write contention becomes visible |
+| SHA-256 blobs | BLAKE3 | If hashing throughput matters on large drives (SHA-256 is used because it is what the protocol side expects) |
+| Conflict blobs kept forever | Expire conflicts after N days | Once the conflict export workflow exists |
 
-Checklist before publishing a build that claims to be a rewrite:
+## Provenance and licensing
 
-- [ ] Contact the upstream author and request an explicit license grant
-      (GPL-3.0 is ideal — it keeps the derivative under the same terms).
-- [ ] If no grant is obtained, verify that the Rust implementation is an independent,
-      clean-room work: no upstream source, no verbatim strings, no direct
-      transliteration of upstream functions.
-- [ ] Keep a written record of the implementation provenance per module
-      (`docs/ARCHITECTURE.md` already maps every Rust module to its upstream origin).
-- [ ] Keep `NOTICE` and the attribution section in `README.md` in place.
-- [ ] Have the final release reviewed by someone competent in licensing before
-      announcing it publicly.
+This project is an independent implementation written from scratch in Rust. No
+source code from another project is vendored or transliterated. The
+inspiration — the idea of a local-first iCloud Drive filesystem for Linux — is
+credited to the community project
+[`IsmaeelAkram/icloud-linux`](https://github.com/IsmaeelAkram/icloud-linux).
 
-Until that is resolved, the repository is published as an **independent Rust
-implementation** with attribution, and the README states the risk explicitly.
+That upstream project ships **no license file**, so it is "all rights reserved"
+by default and nothing from it may be reused without a grant. This repository
+therefore:
+
+- contains no upstream source,
+- credits the idea rather than copying the implementation,
+- documents the design decisions independently in `docs/ARCHITECTURE.md`.
+
+If you want to align with upstream, ask its author for an explicit license
+grant. GPL-3.0 would keep any derivative under the same terms.
 
 ## Non-goals
 
-- No system-wide (root) service — user-level systemd only, like upstream.
+- No system-wide (root) service — user-level systemd only.
 - No aggressive parallel downloads — iCloud throttles and can lock the account.
-- No write support for shared folders / "app libraries" until M2 is done.
+- No write support for shared folders / app libraries until M2.
 
 ## How to help
 
-- Port a scenario from `test_driver.py` to `tests/` — see `CONTRIBUTING.md`.
-- Improve the protocol client — that is the critical path.
+- Implement a piece of the protocol client — that is the critical path.
+- Port a behaviour scenario to `tests/` — see `CONTRIBUTING.md`.
 - File an issue with a reproducible scenario; include `icloudctl doctor` output.

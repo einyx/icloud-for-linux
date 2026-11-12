@@ -7,8 +7,8 @@
 #
 # Run (needs FUSE access):
 #   docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
-#     -v icloud-cache:/var/cache/icloud-linux \
-#     -v icloud-config:/var/config/icloud-linux \
+#     -v icloud-cache:/var/cache/icloud-for-linux \
+#     -v icloud-config:/var/config/icloud-for-linux \
 #     icloud-for-linux:latest mount /mnt/icloud
 
 ARG RUST_VERSION=1.90
@@ -59,15 +59,15 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/icloudctl /usr/local/bin/icloudctl
 
 # State locations (override with -v)
-ENV ICLOUD_CONFIG_DIR=/var/config/icloud-linux \
-    ICLOUD_CACHE_DIR=/var/cache/icloud-linux \
+ENV ICLOUD_CONFIG_DIR=/var/config/icloud-for-linux \
+    ICLOUD_CACHE_DIR=/var/cache/icloud-for-linux \
     XDG_CONFIG_HOME=/var/config \
     XDG_CACHE_HOME=/var/cache \
     XDG_STATE_HOME=/var/state
 
-RUN mkdir -p /var/config/icloud-linux /var/cache/icloud-linux /var/state/icloud-linux /mnt/icloud
+RUN mkdir -p /var/config/icloud-for-linux /var/cache/icloud-for-linux /var/state/icloud-for-linux /mnt/icloud
 
-VOLUME ["/var/config/icloud-linux", "/var/cache/icloud-linux", "/var/state/icloud-linux"]
+VOLUME ["/var/config/icloud-for-linux", "/var/cache/icloud-for-linux", "/var/state/icloud-for-linux"]
 
 ENTRYPOINT ["/usr/local/bin/icloudctl"]
 CMD ["--help"]

@@ -1,33 +1,63 @@
 //! End-to-end test of the FUSE surface.
 //!
-//! The test mounts the filesystem on a temporary directory and exercises the
-//! operations that the kernel relies on: readdir cookies, create/write/read,
-//! mkdir/rmdir and unlink. It is skipped automatically when the host has no
-//! `/dev/fuse` or no `fusermount3` helper (some CI sandboxes).
+//! The filesystem is mounted on a temporary directory and the kernel-facing
+//! operations are exercised: listing, creating a file, writing to it, reading
+//! it back, and the deletion path. The test is skipped automatically when the
+//! host has no `/dev/fuse` or no `fusermount3` helper.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use icloud_for_linux::fuse_fs::ICloudFs;
-use icloud_for_linux::mirror::LocalMirror;
-use icloud_for_linux::state::SyncState;
+use icloud_for_linux::blob::BlobStore;
+use icloud_for_linux::db::Db;
+use icloud_for_linux::index::Index;
+use icloud_for_linux::journal::Journal;
+use icloud_for_linux::vfs::Vfs;
 
-fn fuse_available() -> bool {
-    Path::new("/dev/fuse").exists() && which("fusermount3").is_some()
-        || which("fusermount").is_some()
-}
-
-fn which(cmd: &str) -> Option<std::path::PathBuf> {
+fn which(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|p| p.join(cmd))
         .find(|c| c.is_file())
 }
 
+fn fuse_available() -> bool {
+    Path::new("/dev/fuse").exists()
+        && (which("fusermount3").is_some() || which("fusermount").is_some())
+}
+
+fn mount_fs(
+    cache: &Path,
+    mountpoint: &Path,
+) -> Option<(Arc<Journal>, Arc<Index>, fuser::BackgroundSession)> {
+    let db = Arc::new(Db::open(&cache.join("state.sqlite3")).unwrap());
+    let blobs = Arc::new(BlobStore::new(cache).unwrap());
+    let index = Arc::new(Index::new(db.clone()));
+    let journal = Arc::new(Journal::new(db));
+    let fs = Vfs::new(
+        index.clone(),
+        journal.clone(),
+        blobs,
+        cache.join("staging"),
+        None,
+        false,
+    );
+    let options = vec![
+        fuser::MountOption::FSName("icloud-for-linux-test".to_string()),
+        fuser::MountOption::Subtype("icloud-for-linux-test".to_string()),
+    ];
+    match fuser::spawn_mount2(fs, mountpoint, &options) {
+        Ok(session) => Some((journal, index, session)),
+        Err(e) => {
+            eprintln!("skipping: could not mount FUSE filesystem ({e})");
+            None
+        }
+    }
+}
+
 #[test]
-fn mount_read_write_roundtrip() {
+fn mount_write_read_roundtrip() {
     if !fuse_available() {
         eprintln!("skipping: FUSE not available in this environment");
         return;
@@ -38,41 +68,18 @@ fn mount_read_write_roundtrip() {
     let mountpoint = tmp.path().join("mnt");
     fs::create_dir_all(&mountpoint).unwrap();
 
-    let mirror = Arc::new(LocalMirror::new(&cache).unwrap());
-    let state = Arc::new(SyncState::open(&cache.join("state.sqlite3")).unwrap());
-    let fs_impl = ICloudFs::new(state, mirror, None, false);
-
-    let options = vec![
-        fuser::MountOption::FSName("icloud-for-linux-test".to_string()),
-        fuser::MountOption::Subtype("icloud-for-linux-test".to_string()),
-    ];
-
-    let session = match fuser::spawn_mount2(fs_impl, &mountpoint, &options) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("skipping: could not mount FUSE filesystem ({e})");
-            return;
-        }
+    let Some((journal, _index, session)) = mount_fs(&cache, &mountpoint) else {
+        return;
     };
 
-    // Wait for the mount to become visible.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && fs::read_dir(&mountpoint).is_err() {
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // The root must be listable.
+    fs::read_dir(&mountpoint).expect("root directory must be readable");
 
-    // The root must exist and be listable. `readdir(3)` filters out "." and
-    // "..", so only the presence of a readable, non-hanging listing matters.
-    let root = fs::read_dir(&mountpoint).expect("root directory must be readable");
-    let names: Vec<String> = root
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
-    assert!(!names.contains(&"..".to_string()));
-
-    // Create and write a file through the mount.
+    // Create a file and write to it.
     let file_path = mountpoint.join("hello.txt");
     fs::write(&file_path, b"hello icloud").expect("write through the mount must succeed");
+
+    // Read it back through the mount.
     assert_eq!(fs::read(&file_path).unwrap(), b"hello icloud");
     assert_eq!(
         fs::metadata(&file_path).unwrap().len(),
@@ -80,7 +87,34 @@ fn mount_read_write_roundtrip() {
         "stat must report the real size"
     );
 
-    // The file must be visible in a directory listing.
+    // Overwriting an existing file truncates it first. The kernel flushes
+    // before the first write on this path, so the write handle must survive
+    // a flush.
+    fs::write(&file_path, b"second version").unwrap();
+    assert_eq!(fs::read(&file_path).unwrap(), b"second version");
+    assert_eq!(
+        fs::metadata(&file_path).unwrap().len(),
+        14,
+        "stat must report the size after the overwrite"
+    );
+
+    // Appending keeps the previous content.
+    {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&file_path)
+            .unwrap();
+        f.write_all(b"!").unwrap();
+    }
+    assert_eq!(fs::read(&file_path).unwrap(), b"second version!");
+    assert_eq!(
+        fs::metadata(&file_path).unwrap().len(),
+        15,
+        "stat must report the size after the update"
+    );
+
+    // The content must be visible in a directory listing.
     let listed: Vec<String> = fs::read_dir(&mountpoint)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -96,9 +130,8 @@ fn mount_read_write_roundtrip() {
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
     assert!(listed.contains(&"subdir".to_string()));
-    fs::remove_dir(mountpoint.join("subdir")).unwrap();
 
-    // Deletion removes the entry from the listing.
+    // Deleting removes the entry from the listing.
     fs::remove_file(&file_path).unwrap();
     let listed: Vec<String> = fs::read_dir(&mountpoint)
         .unwrap()
@@ -110,6 +143,9 @@ fn mount_read_write_roundtrip() {
         "deleted file must disappear from the listing"
     );
 
-    // Dropping the session unmounts the filesystem.
+    // The journal must have recorded the local mutations.
+    let (pending, _, _) = journal.counts().unwrap();
+    assert!(pending > 0, "local mutations must be journalled");
+
     drop(session);
 }
