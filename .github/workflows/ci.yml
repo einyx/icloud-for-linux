@@ -55,6 +55,8 @@ jobs:
             libc6-dev-arm64-cross
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
   container:
     name: container image

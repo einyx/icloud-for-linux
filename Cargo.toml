@@ -19,13 +19,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-thiserror = "1"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "signal", "process", "io-util", "sync"] }
-reqwest = { version = "0.12", features = ["json", "cookies", "stream", "rustls-tls"], default-features = false }
 rusqlite = { version = "0.31", features = ["bundled"] }
 # Pure-Rust FUSE: no libfuse headers required, talks to /dev/fuse directly.
 fuser = { version = "0.14", default-features = false }
@@ -35,15 +32,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
 sha2 = "0.10"
 hex = "0.4"
-walkdir = "2"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 parking_lot = "0.12"
-crossbeam-channel = "0.5"
-nix = { version = "0.29", features = ["signal", "fs", "user"] }
-url = "2"
-uuid = { version = "1", features = ["v4"] }
-tempfile = "3"
 shellexpand = "3"
+
+# The HTTP stack for the iCloud protocol client is added with that client
+# (see docs/ROADMAP.md, milestone M1) so the tree stays free of unused
+# dependencies until it is actually needed.
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = true

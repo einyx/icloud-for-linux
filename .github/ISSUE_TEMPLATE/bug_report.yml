@@ -1,0 +1,51 @@
+name: Bug report
+description: Something does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        Please do **not** paste Apple ID credentials, 2FA codes or session
+        cookies into this issue. Redact anything sensitive.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "v0.1.0 or commit sha"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: A minimal, repeatable set of commands.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output of `icloudctl doctor` and the relevant part of `journalctl --user -u icloud.service`.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I removed credentials and cookies from the logs above.
+          required: true
