@@ -53,14 +53,18 @@ Important behaviour:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y fuse3 pkg-config build-essential
+sudo apt-get install -y fuse3 build-essential
 ```
 
 ### Fedora
 
 ```bash
-sudo dnf install fuse fuse-devel gcc make pkgconf-pkg-config
+sudo dnf install fuse gcc make
 ```
+
+The FUSE layer is pure Rust — it talks to `/dev/fuse` directly, so no `libfuse`
+development headers are required. `build-essential` is only needed for the bundled
+SQLite build.
 
 ## Install
 

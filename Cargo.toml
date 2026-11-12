@@ -27,7 +27,8 @@ serde_yaml = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "signal", "process", "io-util", "sync"] }
 reqwest = { version = "0.12", features = ["json", "cookies", "stream", "rustls-tls"], default-features = false }
 rusqlite = { version = "0.31", features = ["bundled"] }
-fuser = "0.14"
+# Pure-Rust FUSE: no libfuse headers required, talks to /dev/fuse directly.
+fuser = { version = "0.14", default-features = false }
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

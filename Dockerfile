@@ -16,9 +16,10 @@ ARG RUST_VERSION=1.90
 # ─────────────────────────────── builder ───────────────────────────────
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 
+# gcc is needed by the bundled SQLite build (rusqlite/bundled); the FUSE layer
+# is pure Rust, so no libfuse headers are needed.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        pkg-config \
         gcc \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -36,7 +37,10 @@ RUN mkdir -p src \
 
 COPY src ./src
 COPY config.example.yaml ./
-RUN cargo build --release --locked
+# `touch` is required: COPY preserves the source mtimes from the build context,
+# which are older than the stub build artefacts, so cargo would otherwise
+# consider the tree unchanged and keep the stub binary.
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 # ─────────────────────────────── runtime ───────────────────────────────
 FROM debian:bookworm-slim AS runtime

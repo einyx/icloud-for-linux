@@ -453,7 +453,6 @@ dependencies = [
  "log",
  "memchr",
  "page_size",
- "pkg-config",
  "smallvec",
  "zerocopy 0.7.35",
 ]
