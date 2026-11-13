@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::blob::BlobStore;
+use crate::blob::{working_copy_path, BlobStore};
 use crate::config::{path_allowed, Config};
 use crate::db::now_ts;
 use crate::icloud_api::{ICloudClient, RemoteKind, RemoteNode};
@@ -31,6 +31,8 @@ pub struct SyncEngine {
     pub journal: Arc<Journal>,
     pub blobs: Arc<BlobStore>,
     pub client: Box<dyn ICloudClient>,
+    /// Paths a hydrator is already working on.
+    claimed: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 impl SyncEngine {
@@ -47,6 +49,7 @@ impl SyncEngine {
             journal,
             blobs,
             client,
+            claimed: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -268,9 +271,10 @@ impl SyncEngine {
                     if remote.etag != node.etag && node.dirty {
                         // Both sides changed: keep the local version as a blob
                         // instead of overwriting it.
+                        let local = self.commit_local(&node.path)?;
                         self.journal.record_conflict(
                             &node.path,
-                            node.digest.as_deref(),
+                            local.as_deref(),
                             remote.etag.as_deref(),
                         )?;
                         info!(path = %node.path, "conflict detected; local version preserved as a blob");
@@ -308,7 +312,81 @@ impl SyncEngine {
         Ok(refreshed)
     }
 
+    // ─────────────────────────── conflicts ────────────────────────────
+
+    /// Commit the local version of a path into the content store.
+    ///
+    /// The working copy is the local truth; committing it gives the conflict
+    /// a blob that survives the next upload and the garbage collector.
+    pub fn commit_local(&self, path: &str) -> Result<Option<String>> {
+        let working = working_copy_path(self.blobs.staging_dir(), path);
+        if !working.exists() {
+            return Ok(self.index.get(path)?.and_then(|node| node.digest));
+        }
+        let size = std::fs::metadata(&working)?.len();
+        let mut reader = std::fs::File::open(&working)?;
+        let digest = self.blobs.put_reader(&mut reader)?;
+        let mut node = self
+            .index
+            .get(path)?
+            .unwrap_or_else(|| Node::new(path, NodeKind::File));
+        node.digest = Some(digest.clone());
+        node.hydrated = true;
+        node.size = size;
+        self.index.upsert(&node)?;
+        Ok(Some(digest))
+    }
+
+    /// The conflicts that were recorded, newest first.
+    pub fn conflicts(&self) -> Result<Vec<crate::journal::Conflict>> {
+        self.journal.conflicts()
+    }
+
     // ─────────────────────────── hydration ─────────────────────────────
+
+    /// Claim paths that should be downloaded in the background.
+    ///
+    /// A path is claimed by exactly one hydrator, so several workers never
+    /// download the same file twice.
+    pub fn claim_hydration_targets(&self, limit: usize) -> Result<Vec<String>> {
+        let nodes = self.index.all()?;
+        let mut claimed = self.claimed.lock();
+        let mut out = Vec::new();
+        for node in nodes {
+            if out.len() >= limit {
+                break;
+            }
+            if node.kind != NodeKind::File || !node.present {
+                continue;
+            }
+            if node.hydrated && node.digest.is_some() {
+                continue;
+            }
+            if !self.entry_allowed(&node.path) {
+                continue;
+            }
+            if claimed.contains(&node.path) {
+                continue;
+            }
+            claimed.insert(node.path.clone());
+            out.push(node.path);
+        }
+        Ok(out)
+    }
+
+    /// Release a claimed path.
+    pub fn release_claim(&self, path: &str) {
+        self.claimed.lock().remove(path);
+    }
+
+    /// Download one file and commit it to the content store.
+    pub fn hydrate_one(&self, path: &str) -> Result<()> {
+        let result = self.ensure_local_file(path);
+        if result.is_err() {
+            self.release_claim(path);
+        }
+        result
+    }
 
     /// Make sure the content of a path is available locally.
     pub fn ensure_local_file(&self, path: &str) -> Result<()> {
@@ -338,6 +416,57 @@ impl SyncEngine {
         self.index
             .set_digest(path, Some(&digest), true, Some(size))?;
         Ok(())
+    }
+
+    /// List a subtree of the drive and download everything in it.
+    ///
+    /// The index is filled on demand, so a subtree has to be listed before
+    /// its files can be downloaded. This is the explicit counterpart of the
+    /// background hydration: the user asks for a folder, the client walks it
+    /// and the files land in the content store.
+    pub fn hydrate_subtree(&self, path: &str) -> Result<(usize, usize)> {
+        let root = crate::config::normalize_icloud_path(path);
+        let mut directories = vec![root.clone()];
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut files: Vec<String> = Vec::new();
+
+        while let Some(directory) = directories.pop() {
+            if !visited.insert(directory.clone()) {
+                continue;
+            }
+            if !self.entry_allowed(&directory) {
+                continue;
+            }
+            let children = match self.client.list_children(&directory) {
+                Ok(children) => children,
+                Err(e) => {
+                    warn!(path = %directory, error = %e, "listing failed");
+                    continue;
+                }
+            };
+            for child in children {
+                let child_path = if directory == "/" {
+                    format!("/{}", child.path)
+                } else {
+                    format!("{}/{}", directory.trim_end_matches('/'), child.path)
+                };
+                self.store_remote(&child_path, &child)?;
+                match child.kind {
+                    RemoteKind::Folder => directories.push(child_path),
+                    RemoteKind::File => files.push(child_path),
+                }
+            }
+        }
+
+        let total = files.len();
+        let mut done = 0;
+        for file in files {
+            match self.ensure_local_file(&file) {
+                Ok(()) => done += 1,
+                Err(e) => warn!(path = %file, error = %e, "hydration failed"),
+            }
+        }
+        Ok((total, done))
     }
 
     /// Download every eligible file that is not local yet.
@@ -374,6 +503,8 @@ impl SyncEngine {
     pub fn live_digests(&self) -> Result<HashSet<String>> {
         let mut set = self.index.referenced_digests()?;
         set.extend(self.journal.referenced_digests()?);
+        // The versions that lost a conflict have to survive as well.
+        set.extend(self.journal.conflict_digests()?);
         Ok(set)
     }
 

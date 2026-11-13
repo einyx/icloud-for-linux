@@ -17,9 +17,13 @@ cookie_dir: "~/.config/icloud-for-linux/cookies"
 index_ttl_seconds: 300
 
 # How file content is fetched.
-#   lazy     — download a file the first time it is opened
+#   lazy      — download a file the first time it is opened
 #   background — keep eligible files downloaded ahead of time
 hydration: "lazy"
+
+# How many files may be downloaded ahead of time at once. iCloud throttles
+# aggressive parallel downloads, and a throttled account is a locked account.
+hydration_workers: 1
 
 # What happens when a path changed both locally and remotely.
 #   keep-local  — preserve the local version as a blob in the local store

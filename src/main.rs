@@ -88,12 +88,25 @@ enum Command {
         /// Print what would happen without contacting the remote.
         #[arg(long)]
         dry_run: bool,
+        /// Seconds to wait for a running driver to finish.
+        #[arg(long, default_value_t = 900)]
+        timeout: u64,
     },
-    /// Download the content of every eligible file into the local store.
+    /// List the conflicts that were preserved.
+    Conflicts,
+    /// Write the preserved conflict versions into a directory.
+    ExportConflicts {
+        /// Directory the versions are written to.
+        dest: PathBuf,
+    },
+    /// Download the content of files into the local store.
     Hydrate {
         /// Report what would be downloaded without downloading.
         #[arg(long)]
         dry_run: bool,
+        /// Hydrate this subtree of the drive (e.g. /Downloads).
+        #[arg(long)]
+        path: Option<String>,
     },
     /// Materialise a subtree of the drive as plain files in a directory.
     Export {
@@ -267,37 +280,14 @@ fn cmd_mount(mount_dir: Option<PathBuf>, config: Option<PathBuf>, foreground: bo
     }
     let _ = foreground;
 
-    // The background loops: drain the journal and refresh stale metadata.
-    if store.config.auto_sync {
-        let engine = engine.clone();
-        let upload_interval = store.config.upload_interval_seconds.max(5);
-        let refresh_interval = store.config.remote_refresh_interval_seconds.max(30);
-        std::thread::Builder::new()
-            .name("icloud-sync".to_string())
-            .spawn(move || {
-                let mut elapsed = 0u64;
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                    elapsed += 5;
-                    if elapsed.is_multiple_of(upload_interval) {
-                        match engine.sync_once() {
-                            Ok(report) => {
-                                if report.drained > 0 || report.refreshed > 0 {
-                                    tracing::info!(
-                                        drained = report.drained,
-                                        refreshed = report.refreshed,
-                                        "sync pass finished"
-                                    );
-                                }
-                            }
-                            Err(e) => tracing::warn!(error = %e, "sync pass failed"),
-                        }
-                    }
-                    let _ = refresh_interval;
-                }
-            })
-            .ok();
-    }
+    // The control loop: on-demand syncs, the automatic schedule and the
+    // background hydration.
+    icloud_for_linux::control::Control::new(
+        engine.clone(),
+        store.config.clone(),
+        service::sync_marker(),
+    )
+    .spawn();
 
     let hydrate: vfs::HydrateFn = {
         let engine = engine.clone();
@@ -342,7 +332,7 @@ fn cmd_unmount(mount_dir: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_sync(dry_run: bool) -> Result<()> {
+fn cmd_sync(dry_run: bool, timeout: u64) -> Result<()> {
     let config_path = resolve_config(None);
     let store = open_store(&config_path)?;
     let client = build_client(&store.config);
@@ -372,6 +362,28 @@ fn cmd_sync(dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
+    // A running driver owns the session: ask it to sync and wait for the
+    // completion marker. Without a driver the pass runs here.
+    if let Some(pid) = service::service_main_pid() {
+        let marker = service::sync_marker();
+        let _ = std::fs::remove_file(&marker);
+        println!("Requesting a sync from the running driver (pid {pid})...");
+        icloud_for_linux::signal::request_sync(pid)
+            .with_context(|| format!("could not signal the driver process (pid {pid})"))?;
+        match icloud_for_linux::control::wait_for_marker(
+            &marker,
+            std::time::Duration::from_secs(timeout),
+        ) {
+            Ok(()) => {
+                println!("Sync complete.");
+                return Ok(());
+            }
+            Err(e) => {
+                anyhow::bail!("{e} (check the logs with `icloudctl logs`)");
+            }
+        }
+    }
+
     let report = engine.sync_once()?;
     println!(
         "Sync complete: {} operation(s) applied, {} entry/entries refreshed",
@@ -380,7 +392,70 @@ fn cmd_sync(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_hydrate(dry_run: bool) -> Result<()> {
+fn cmd_conflicts() -> Result<()> {
+    let config_path = resolve_config(None);
+    let store = open_store(&config_path)?;
+    let conflicts = store.journal.conflicts()?;
+    if conflicts.is_empty() {
+        println!("No conflicts recorded.");
+        return Ok(());
+    }
+    println!("icloud-for-linux conflicts");
+    for conflict in &conflicts {
+        let present = conflict
+            .local_digest
+            .as_ref()
+            .map(|digest| store.blobs.contains(digest))
+            .unwrap_or(false);
+        println!(
+            "  {}  ({})  {}",
+            conflict.path,
+            if present { "blob kept" } else { "blob missing" },
+            conflict
+                .local_digest
+                .as_deref()
+                .map(|d| &d[..d.len().min(12)])
+                .unwrap_or("-")
+        );
+    }
+    println!();
+    println!("Export them with: icloudctl export-conflicts <directory>");
+    Ok(())
+}
+
+fn cmd_export_conflicts(dest: PathBuf) -> Result<()> {
+    let config_path = resolve_config(None);
+    let store = open_store(&config_path)?;
+    let conflicts = store.journal.conflicts()?;
+    if conflicts.is_empty() {
+        println!("No conflicts recorded.");
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dest)?;
+    let mut exported = 0;
+    for conflict in &conflicts {
+        let Some(digest) = conflict.local_digest.as_ref() else {
+            continue;
+        };
+        if !store.blobs.contains(digest) {
+            continue;
+        }
+        let relative = conflict.path.trim_start_matches('/');
+        let name = format!(
+            "{}.local-conflict-{}",
+            relative.replace('/', "_"),
+            conflict.created_at
+        );
+        let target = dest.join(name);
+        store.blobs.link_to(digest, &target)?;
+        println!("  {}", target.display());
+        exported += 1;
+    }
+    println!("Exported {exported} conflict(s) to {}", dest.display());
+    Ok(())
+}
+
+fn cmd_hydrate(dry_run: bool, path: Option<String>) -> Result<()> {
     let config_path = resolve_config(None);
     let store = open_store(&config_path)?;
     let client = build_client(&store.config);
@@ -391,7 +466,17 @@ fn cmd_hydrate(dry_run: bool) -> Result<()> {
         store.blobs.clone(),
         Box::new(client),
     );
-    let (pending, done) = engine.hydrate_all(dry_run)?;
+    let (pending, done) = match &path {
+        Some(path) => {
+            if dry_run {
+                let total = engine.index.all()?.len();
+                (total, 0)
+            } else {
+                engine.hydrate_subtree(path)?
+            }
+        }
+        None => engine.hydrate_all(dry_run)?,
+    };
     let sync_paths = store
         .config
         .sync_paths
@@ -408,6 +493,9 @@ fn cmd_hydrate(dry_run: bool) -> Result<()> {
     println!("  sync_paths:    {}", sync_paths);
     println!("  exclude_paths: {}", exclude_paths);
     println!();
+    if let Some(path) = &path {
+        println!("  Subtree:                 {}", path);
+    }
     println!("  Files needing download: {}", pending);
     println!("  Downloaded:              {}", done);
     if dry_run {
@@ -593,8 +681,10 @@ fn main() -> Result<()> {
             foreground,
         } => cmd_mount(mount_dir, config, foreground),
         Command::Unmount { mount_dir } => cmd_unmount(mount_dir),
-        Command::Sync { dry_run } => cmd_sync(dry_run),
-        Command::Hydrate { dry_run } => cmd_hydrate(dry_run),
+        Command::Sync { dry_run, timeout } => cmd_sync(dry_run, timeout),
+        Command::Conflicts => cmd_conflicts(),
+        Command::ExportConflicts { dest } => cmd_export_conflicts(dest),
+        Command::Hydrate { dry_run, path } => cmd_hydrate(dry_run, path),
         Command::Export { path, dest } => cmd_export(path, dest),
         Command::Verify => cmd_verify(),
         Command::Gc => cmd_gc(),

@@ -19,6 +19,9 @@ Status and plan for `icloud-for-linux`.
 | Interactive 2FA bootstrap | ✅ Done | `src/auth.rs` — push code and SMS fallback |
 | Background drain/refresh loops | ✅ Done | `src/main.rs` — the sync loop runs while the mount is served |
 | Conflict resolution end to end | ✅ Done | the local version is kept as a blob and recorded |
+| On-demand sync over `SIGUSR1` | ✅ Done | the driver writes a completion marker |
+| Background hydration | ✅ Done | a small worker pool, one worker by default |
+| Conflict export | ✅ Done | `icloudctl conflicts`, `icloudctl export-conflicts` |
 | Lazy resolution through the mount | ✅ Done | `lookup`/`readdir` resolve through the client on demand |
 
 ## Milestones
@@ -40,14 +43,20 @@ The protocol is covered by 14 tests that run against scripted responses, so
 no account is needed to verify it. The SRP proof is checked against a server
 side computation rather than a recorded value.
 
-### M2 — Background loops and conflicts ✅ mostly done
+### M2 — Background loops and conflicts ✅ done
 
 - drain and refresh timers driven by `upload_interval_seconds` ✅
-- `auto_sync: false` on-demand path (`icloudctl sync`) ✅
+- `auto_sync: false` on-demand path: `icloudctl sync` signals the running
+  driver over `SIGUSR1` and waits for the completion marker ✅
 - lazy resolution: `lookup` and `readdir` ask the service on demand ✅
-- conflict blobs are captured and recorded ✅
-- still open: conflict blob export (`icloudctl export-conflicts`), background
-  hydration (prefetching eligible files), the `SIGUSR1` completion marker
+- background hydration: a small pool of workers downloads the files the
+  index knows about (`hydration: background`, `hydration_workers`) ✅
+- subtree hydration: `icloudctl hydrate --path /Downloads` lists a subtree
+  through the service and downloads it ✅
+- conflicts: the local version is committed to the content store, recorded,
+  listed with `icloudctl conflicts` and exported with
+  `icloudctl export-conflicts` ✅
+- the garbage collector keeps the blobs a conflict refers to ✅
 
 ### M3 — Parity & hardening
 

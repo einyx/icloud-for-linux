@@ -247,6 +247,20 @@ impl Journal {
         Ok(out)
     }
 
+    /// Digests of the versions that lost a conflict — the garbage collector
+    /// has to keep them.
+    pub fn conflict_digests(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.db.lock();
+        let mut stmt =
+            conn.prepare("SELECT local_digest FROM conflicts WHERE local_digest IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            out.insert(r?);
+        }
+        Ok(out)
+    }
+
     pub fn counts(&self) -> Result<(usize, usize, usize)> {
         let conn = self.db.lock();
         let pending: i64 = conn.query_row(

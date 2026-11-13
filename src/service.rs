@@ -43,6 +43,11 @@ pub fn log_file() -> PathBuf {
     state_dir().join("icloud.log")
 }
 
+/// The marker the driver writes when an on-demand sync finished.
+pub fn sync_marker() -> PathBuf {
+    state_dir().join("sync_done")
+}
+
 pub fn ensure_dirs() -> Result<()> {
     let unit_dir = service_file().parent().unwrap().to_path_buf();
     for d in [config_dir(), state_dir(), cache_dir(), unit_dir] {

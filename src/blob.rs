@@ -259,6 +259,17 @@ fn shard_name(shard: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The path of the working copy of an iCloud path.
+///
+/// The name is derived from the path, so the working copy can be found
+/// without keeping a map in memory — the sync engine needs it to preserve the
+/// local version of a conflicted path.
+pub fn working_copy_path(staging_dir: &Path, icloud_path: &str) -> PathBuf {
+    let mut name = digest_of(icloud_path.as_bytes());
+    name.truncate(32);
+    staging_dir.join(format!("{}.work", name))
+}
+
 /// Validate and lowercase a digest string.
 pub fn normalize_digest(digest: &str) -> Result<String> {
     let d = digest.trim().to_ascii_lowercase();

@@ -132,6 +132,22 @@ scripted responses: no account and no network are needed to verify the flow.
 The SRP implementation is checked against a server side computation, so the
 algebra is verified rather than a recorded value.
 
+## The control loop
+
+While the filesystem is mounted, one thread (`src/control.rs`) keeps the local
+state in step with the remote:
+
+* `SIGUSR1` raises a flag that the loop picks up; it then runs a single pass
+  and writes a completion marker, which is what `icloudctl sync` waits for.
+* with `auto_sync` the journal is drained and stale metadata is refreshed on
+  the configured schedule.
+* with `hydration: background` a small pool of workers downloads the files the
+  index knows about. Each file is claimed by exactly one worker, so nothing is
+  downloaded twice.
+
+The signal handler itself only stores a flag — no allocation, no I/O in signal
+context.
+
 ## Concurrency
 
 - The FUSE session runs on its own thread.

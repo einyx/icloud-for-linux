@@ -43,6 +43,11 @@ pub struct Config {
     /// `lazy` downloads a file when it is opened, `background` downloads
     /// eligible files ahead of time.
     pub hydration: String,
+    /// How many files may be downloaded ahead of time at once.
+    ///
+    /// iCloud throttles aggressive parallel downloads, and a throttled
+    /// account is a locked account. One worker is the safe default.
+    pub hydration_workers: usize,
     /// `keep-local` preserves the local version of a diverged path as a blob,
     /// `keep-remote` accepts the remote version.
     pub conflict_policy: String,
@@ -68,6 +73,7 @@ impl Default for Config {
             cookie_dir: "~/.config/icloud-for-linux/cookies".to_string(),
             index_ttl_seconds: 300,
             hydration: "lazy".to_string(),
+            hydration_workers: 1,
             conflict_policy: "keep-local".to_string(),
             upload_interval_seconds: 30,
             remote_refresh_interval_seconds: 300,

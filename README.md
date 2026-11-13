@@ -111,8 +111,10 @@ icloud-for-linux.service` runs the same mount in the background afterwards.
 | `icloudctl auth` | Interactive Apple ID + 2FA bootstrap |
 | `icloudctl mount [dir]` | Mount the filesystem (foreground) |
 | `icloudctl unmount [dir]` | Unmount the filesystem |
-| `icloudctl sync [--dry-run]` | Drain the journal and refresh stale metadata |
-| `icloudctl hydrate [--dry-run]` | Download the content of every eligible file |
+| `icloudctl sync [--dry-run] [--timeout SEC]` | Drain the journal and refresh stale metadata |
+| `icloudctl hydrate [--dry-run] [--path PATH]` | Download files into the local store (`--path` walks a subtree) |
+| `icloudctl conflicts` | List the conflicts that were preserved |
+| `icloudctl export-conflicts DIR` | Write the preserved conflict versions into a directory |
 | `icloudctl export <path> <dir>` | Materialise a subtree as plain files |
 | `icloudctl verify` | Re-hash every blob and report corruption |
 | `icloudctl gc` | Remove blobs nothing references any more |
@@ -184,11 +186,13 @@ For a rename or move, **both** the source and the destination must be permitted.
 **`auto_sync: true`** (default) — the drain and refresh loops run automatically.
 
 **`auto_sync: false`** — nothing runs in the background. The driver mounts and
-waits; `icloudctl sync` runs a single pass when you want one.
+waits; `icloudctl sync` runs a single pass when you want one. It asks the
+running driver over `SIGUSR1` and waits for the completion marker, so the pass
+happens in the process that owns the session.
 
 ```bash
 icloudctl sync          # apply pending changes, refresh stale metadata
-icloudctl hydrate       # download the content of every eligible file
+icloudctl hydrate       # download the files the index knows
 icloudctl export /Downloads ~/Desktop/intake   # copy out as plain files
 ```
 

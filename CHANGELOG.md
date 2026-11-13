@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — background work
+
+### Added
+
+- **On-demand sync over `SIGUSR1`.** The running driver answers the signal
+  with a single pass and writes a completion marker. `icloudctl sync` asks
+  the driver, waits for the marker and reports the result; without a driver
+  the pass runs in the calling process.
+- **Background hydration.** With `hydration: background` a small pool of
+  workers downloads the files the index knows about. The pool is deliberately
+  small: iCloud throttles aggressive parallel downloads.
+- **Subtree hydration.** `icloudctl hydrate --path /Downloads` lists the
+  subtree through the service and downloads it, so a folder can be prefetched
+  without crawling the drive.
+- **Conflict export.** `icloudctl conflicts` lists the preserved versions and
+  `icloudctl export-conflicts <dir>` writes them out.
+- **A conflict keeps the local version.** When a path diverged on both sides,
+  the working copy is committed to the content store before the remote version
+  wins, so nothing is lost.
+- The garbage collector keeps the blobs a conflict refers to.
+- 7 new tests for the background work: conflict capture, conflict export,
+  hydration claims, subtree hydration, the journal drain, the signal flag and
+  the completion marker.
+
+### Changed
+
+- The control loop is one component (`src/control.rs`): it handles the
+  one-shot requests, the automatic schedule and the hydration workers.
+- The signal handler only sets a flag; the loop picks it up. Nothing but an
+  atomic store happens in signal context.
+
 ## [0.3.0] — the iCloud protocol client
 
 ### Added

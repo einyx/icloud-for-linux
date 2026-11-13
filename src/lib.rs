@@ -18,12 +18,15 @@
 
 pub mod auth;
 pub mod blob;
+pub mod clock;
 pub mod config;
+pub mod control;
 pub mod db;
 pub mod icloud;
 pub mod icloud_api;
 pub mod index;
 pub mod journal;
 pub mod service;
+pub mod signal;
 pub mod sync;
 pub mod vfs;

@@ -231,9 +231,7 @@ impl Vfs {
 
     /// Path of the working copy for an iCloud path.
     fn working_copy(&self, path: &str) -> PathBuf {
-        let mut hasher = crate::blob::digest_of(path.as_bytes());
-        hasher.truncate(32);
-        self.staging_dir.join(format!("{}.work", hasher))
+        crate::blob::working_copy_path(&self.staging_dir, path)
     }
 
     /// Make sure a working copy exists for a path, seeded from the blob store.
