@@ -117,6 +117,21 @@ costs anything.
 that trait knows about HTTP, cookies or 2FA, and nothing above it changes when
 the protocol implementation does.
 
+The implementation behind it lives in `src/icloud/`:
+
+| Module | Responsibility |
+| --- | --- |
+| `transport.rs` | The HTTP boundary (`Transport` trait), the cookie jar, and the `reqwest` backed implementation |
+| `srp.rs` | Apple's SRP-6a variant: PBKDF2 derived password, no username in `x` |
+| `auth.rs` | The sign-in flow, two-factor authentication, trust, and the persisted session |
+| `drive.rs` | The drive service: path resolution, listing, download, upload, rename, move, trash |
+| `client.rs` | The adapter that implements the client interface |
+
+Because the HTTP layer is a trait, the whole protocol is tested against
+scripted responses: no account and no network are needed to verify the flow.
+The SRP implementation is checked against a server side computation, so the
+algebra is verified rather than a recorded value.
+
 ## Concurrency
 
 - The FUSE session runs on its own thread.

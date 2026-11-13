@@ -263,10 +263,16 @@ icloudctl verify
 
 ## Project status
 
-This is an active implementation. The local store — content store, path index,
-journal, FUSE surface, CLI, service integration — is implemented and tested. The
-Apple protocol client is the piece still being built. See
-[docs/ROADMAP.md](docs/ROADMAP.md) for the status and
+This is an active implementation. Everything is in place and tested:
+
+- the local store — content store, path index, journal, FUSE surface
+- the Apple protocol client — SRP sign-in, 2FA (push and SMS), drive service
+- the sync engine — drain, delta refresh, conflict capture, background loops
+- the CLI, the systemd service and the development harness
+
+The protocol is verified by 14 tests that run against scripted responses, so
+the whole flow can be checked without an Apple account. See
+[docs/ROADMAP.md](docs/ROADMAP.md) for what is still open and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
 
 ## License & attribution

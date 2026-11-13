@@ -20,8 +20,9 @@ use tracing::{info, warn};
 
 use crate::blob::BlobStore;
 use crate::config::{path_allowed, Config};
-use crate::icloud_api::ICloudClient;
-use crate::index::Index;
+use crate::db::now_ts;
+use crate::icloud_api::{ICloudClient, RemoteKind, RemoteNode};
+use crate::index::{name_of, parent_of, Index, Node, NodeKind};
 use crate::journal::{Journal, Op};
 
 pub struct SyncEngine {
@@ -79,6 +80,68 @@ impl SyncEngine {
         })
     }
 
+    // ───────────────────────── remote lookups ─────────────────────────
+
+    /// Resolve a path, using the index when it is fresh and the remote
+    /// otherwise.
+    pub fn resolve_path(&self, path: &str) -> Result<Option<RemoteNode>> {
+        if let Some(node) = self.index.get(path)? {
+            if node.present && !self.is_stale(&node) {
+                return Ok(Some(to_remote(&node)));
+            }
+        }
+        let Some(remote) = self.client.stat_node(path)? else {
+            let _ = self.index.set_present(path, false);
+            return Ok(None);
+        };
+        self.store_remote(path, &remote)?;
+        Ok(Some(remote))
+    }
+
+    /// The children of a directory, from the remote.
+    pub fn list_dir(&self, path: &str) -> Result<Vec<RemoteNode>> {
+        let children = self.client.list_children(path)?;
+        for child in &children {
+            let child_path = if path == "/" {
+                format!("/{}", child.path)
+            } else {
+                format!("{}/{}", path.trim_end_matches('/'), child.path)
+            };
+            self.store_remote(&child_path, child)?;
+        }
+        Ok(children)
+    }
+
+    fn store_remote(&self, path: &str, remote: &RemoteNode) -> Result<()> {
+        let kind = match remote.kind {
+            RemoteKind::Folder => NodeKind::Folder,
+            RemoteKind::File => NodeKind::File,
+        };
+        let mut node = self
+            .index
+            .get(path)?
+            .unwrap_or_else(|| Node::new(path, kind));
+        node.kind = kind;
+        node.size = remote.size;
+        node.mtime = remote.mtime;
+        node.etag = remote.etag.clone();
+        node.remote_id = remote.remote_id.clone();
+        node.docwsid = remote.docwsid.clone();
+        node.zone = remote.zone.clone();
+        node.fetched_at = now_ts();
+        if kind == NodeKind::Folder {
+            node.hydrated = true;
+        }
+        self.index.upsert(&node)?;
+        Ok(())
+    }
+
+    fn is_stale(&self, node: &Node) -> bool {
+        now_ts() - node.fetched_at > self.config.index_ttl_seconds as i64
+    }
+
+    // ─────────────────────────── the journal ───────────────────────────
+
     /// Apply every pending journal operation to the remote.
     pub fn drain_journal(&self) -> Result<usize> {
         let ops = self.journal.pending()?;
@@ -88,12 +151,11 @@ impl SyncEngine {
                 self.journal.mark_done(op.id)?;
                 continue;
             }
-            let outcome = self.apply_op(&op);
-            match outcome {
+            match self.apply_op(&op) {
                 Ok(()) => {
                     self.journal.mark_done(op.id)?;
                     applied += 1;
-                    self.index.set_dirty(&op.path, false)?;
+                    let _ = self.index.set_dirty(&op.path, false);
                 }
                 Err(e) => {
                     warn!(path = %op.path, error = %e, "operation failed");
@@ -109,10 +171,10 @@ impl SyncEngine {
         match op.op {
             Op::Create | Op::Write => {
                 let digest = match op.digest.clone() {
-                    Some(d) => d,
+                    Some(digest) => digest,
                     None => match self.index.get(&op.path) {
                         Ok(Some(node)) => match node.digest {
-                            Some(d) => d,
+                            Some(digest) => digest,
                             None => {
                                 return Err(anyhow!("no local content to upload for {}", op.path))
                             }
@@ -120,32 +182,37 @@ impl SyncEngine {
                         _ => return Err(anyhow!("no local content to upload for {}", op.path)),
                     },
                 };
-                let parent = crate::index::parent_of(&op.path);
-                let name = crate::index::name_of(&op.path);
                 let blob = self.blobs.path(&digest)?;
-                let node = self.client.upload_file(&blob, &parent, &name)?;
-                let mut updated = self.index.get(&op.path)?.unwrap_or_else(|| {
-                    crate::index::Node::new(&op.path, crate::index::NodeKind::File)
-                });
-                updated.etag = node.etag.clone();
-                updated.remote_id = node.remote_id.clone();
-                updated.mtime = node.mtime;
-                updated.size = node.size;
+                let parent = parent_of(&op.path);
+                let name = name_of(&op.path);
+                let remote = self.client.upload_file(&blob, &parent, &name)?;
+                let mut updated = self
+                    .index
+                    .get(&op.path)?
+                    .unwrap_or_else(|| Node::new(&op.path, NodeKind::File));
+                updated.etag = remote.etag.clone();
+                updated.remote_id = remote.remote_id.clone();
+                updated.docwsid = remote.docwsid.clone();
+                updated.zone = remote.zone.clone();
+                updated.mtime = remote.mtime;
+                updated.size = remote.size;
                 updated.dirty = false;
-                updated.fetched_at = crate::db::now_ts();
+                updated.fetched_at = now_ts();
                 self.index.upsert(&updated)?;
             }
             Op::Mkdir => {
-                let parent = crate::index::parent_of(&op.path);
-                let name = crate::index::name_of(&op.path);
-                let node = self.client.mkdir(&parent, &name)?;
-                let mut updated = self.index.get(&op.path)?.unwrap_or_else(|| {
-                    crate::index::Node::new(&op.path, crate::index::NodeKind::Folder)
-                });
-                updated.etag = node.etag.clone();
-                updated.remote_id = node.remote_id.clone();
+                let parent = parent_of(&op.path);
+                let name = name_of(&op.path);
+                let remote = self.client.mkdir(&parent, &name)?;
+                let mut updated = self
+                    .index
+                    .get(&op.path)?
+                    .unwrap_or_else(|| Node::new(&op.path, NodeKind::Folder));
+                updated.etag = remote.etag.clone();
+                updated.remote_id = remote.remote_id.clone();
+                updated.docwsid = remote.docwsid.clone();
                 updated.dirty = false;
-                updated.fetched_at = crate::db::now_ts();
+                updated.fetched_at = now_ts();
                 self.index.upsert(&updated)?;
             }
             Op::Remove => {
@@ -162,21 +229,25 @@ impl SyncEngine {
                     .target_path
                     .clone()
                     .ok_or_else(|| anyhow!("rename without a source path"))?;
-                let parent = crate::index::parent_of(&op.path);
-                let name = crate::index::name_of(&op.path);
-                let node = self.client.rename_move(&target, &parent, &name)?;
-                let mut updated = self.index.get(&op.path)?.unwrap_or_else(|| {
-                    crate::index::Node::new(&op.path, crate::index::NodeKind::File)
-                });
-                updated.remote_id = node.remote_id.clone();
-                updated.etag = node.etag.clone();
+                let parent = parent_of(&op.path);
+                let name = name_of(&op.path);
+                let remote = self.client.rename_move(&target, &parent, &name)?;
+                let mut updated = self
+                    .index
+                    .get(&op.path)?
+                    .unwrap_or_else(|| Node::new(&op.path, NodeKind::File));
+                updated.remote_id = remote.remote_id.clone();
+                updated.etag = remote.etag.clone();
+                updated.docwsid = remote.docwsid.clone();
                 updated.dirty = false;
-                updated.fetched_at = crate::db::now_ts();
+                updated.fetched_at = now_ts();
                 self.index.upsert(&updated)?;
             }
         }
         Ok(())
     }
+
+    // ──────────────────────────── refresh ──────────────────────────────
 
     /// Re-validate the metadata that aged past the TTL.
     ///
@@ -207,9 +278,11 @@ impl SyncEngine {
                     let mut updated = node.clone();
                     updated.etag = remote.etag.clone();
                     updated.remote_id = remote.remote_id.clone();
+                    updated.docwsid = remote.docwsid.clone();
+                    updated.zone = remote.zone.clone();
                     updated.size = remote.size;
                     updated.mtime = remote.mtime;
-                    updated.fetched_at = crate::db::now_ts();
+                    updated.fetched_at = now_ts();
                     if !node.dirty {
                         updated.digest = None;
                         updated.hydrated = false;
@@ -235,6 +308,8 @@ impl SyncEngine {
         Ok(refreshed)
     }
 
+    // ─────────────────────────── hydration ─────────────────────────────
+
     /// Make sure the content of a path is available locally.
     pub fn ensure_local_file(&self, path: &str) -> Result<()> {
         if !self.entry_allowed(path) {
@@ -246,12 +321,23 @@ impl SyncEngine {
         if node.hydrated && node.digest.is_some() {
             return Ok(());
         }
-        let Some(remote_id) = node.remote_id.clone() else {
-            return Ok(());
+        let remote = to_remote(&node);
+        if remote.docwsid.is_none() && remote.remote_id.is_none() {
+            return Err(anyhow!("the remote metadata for {} is incomplete", path));
+        }
+
+        // Download into the store; the blob is only linked into the index once
+        // it is complete and hashed.
+        let tmp = self.blobs.staging_dir().join("download.part");
+        let size = self.client.download_file(&remote, &tmp)?;
+        let digest = {
+            let mut file = std::fs::File::open(&tmp)?;
+            self.blobs.put_reader(&mut file)?
         };
-        let blob = self.blobs.path(&format!("pending-{}", remote_id));
-        let _ = blob; // placeholder: the real download lands with the client
-        Err(anyhow!("content for {} is not local yet", path))
+        let _ = std::fs::remove_file(&tmp);
+        self.index
+            .set_digest(path, Some(&digest), true, Some(size))?;
+        Ok(())
     }
 
     /// Download every eligible file that is not local yet.
@@ -259,7 +345,7 @@ impl SyncEngine {
         let nodes = self.index.all()?;
         let mut pending = Vec::new();
         for node in nodes {
-            if node.kind != crate::index::NodeKind::File {
+            if node.kind != NodeKind::File {
                 continue;
             }
             if node.hydrated && node.digest.is_some() {
@@ -273,8 +359,8 @@ impl SyncEngine {
         if dry_run {
             return Ok((pending.len(), 0));
         }
-        let mut done = 0;
         let total = pending.len();
+        let mut done = 0;
         for node in pending {
             match self.ensure_local_file(&node.path) {
                 Ok(()) => done += 1,
@@ -297,6 +383,23 @@ impl SyncEngine {
             self.config.sync_paths.as_deref(),
             &self.config.exclude_paths,
         )
+    }
+}
+
+/// Convert an index entry into the node type of the client interface.
+fn to_remote(node: &Node) -> RemoteNode {
+    RemoteNode {
+        path: node.path.clone(),
+        kind: match node.kind {
+            NodeKind::Folder => RemoteKind::Folder,
+            NodeKind::File => RemoteKind::File,
+        },
+        remote_id: node.remote_id.clone(),
+        docwsid: node.docwsid.clone(),
+        zone: node.zone.clone(),
+        etag: node.etag.clone(),
+        size: node.size,
+        mtime: node.mtime,
     }
 }
 

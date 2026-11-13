@@ -45,6 +45,10 @@ pub struct Node {
     pub mtime: i64,
     pub etag: Option<String>,
     pub remote_id: Option<String>,
+    /// Identifier of the document that carries the content.
+    pub docwsid: Option<String>,
+    /// The zone the document lives in.
+    pub zone: Option<String>,
     /// Digest of the local blob holding the content, when hydrated.
     pub digest: Option<String>,
     pub hydrated: bool,
@@ -63,6 +67,8 @@ impl Node {
             mtime: 0,
             etag: None,
             remote_id: None,
+            docwsid: None,
+            zone: None,
             digest: None,
             hydrated: false,
             dirty: false,
@@ -97,7 +103,7 @@ impl Index {
     pub fn get(&self, path: &str) -> Result<Option<Node>> {
         let conn = self.db.lock();
         let mut stmt = conn.prepare(
-            "SELECT path, kind, size, mtime, etag, remote_id, digest, hydrated, dirty, present, fetched_at \
+            "SELECT path, kind, size, mtime, etag, remote_id, docwsid, zone, digest, hydrated, dirty, present, fetched_at \
              FROM nodes WHERE path = ?1",
         )?;
         let node = stmt.query_row(params![path], row_to_node).ok();
@@ -107,7 +113,7 @@ impl Index {
     pub fn children(&self, parent: &str) -> Result<Vec<Node>> {
         let conn = self.db.lock();
         let mut stmt = conn.prepare(
-            "SELECT path, kind, size, mtime, etag, remote_id, digest, hydrated, dirty, present, fetched_at \
+            "SELECT path, kind, size, mtime, etag, remote_id, docwsid, zone, digest, hydrated, dirty, present, fetched_at \
              FROM nodes WHERE parent = ?1 AND present = 1 ORDER BY kind DESC, path ASC",
         )?;
         let rows = stmt.query_map(params![parent], row_to_node)?;
@@ -121,11 +127,12 @@ impl Index {
     pub fn upsert(&self, node: &Node) -> Result<()> {
         let conn = self.db.lock();
         conn.execute(
-            "INSERT INTO nodes (path, parent, kind, size, mtime, etag, remote_id, digest, hydrated, dirty, present, fetched_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+            "INSERT INTO nodes (path, parent, kind, size, mtime, etag, remote_id, docwsid, zone, digest, hydrated, dirty, present, fetched_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
              ON CONFLICT(path) DO UPDATE SET \
                parent = excluded.parent, kind = excluded.kind, size = excluded.size, mtime = excluded.mtime, \
                etag = excluded.etag, remote_id = excluded.remote_id, digest = excluded.digest, \
+               docwsid = excluded.docwsid, zone = excluded.zone, \
                hydrated = excluded.hydrated, dirty = excluded.dirty, present = excluded.present, \
                fetched_at = excluded.fetched_at",
             params![
@@ -136,6 +143,8 @@ impl Index {
                 node.mtime,
                 node.etag,
                 node.remote_id,
+                node.docwsid,
+                node.zone,
                 node.digest,
                 node.hydrated as i64,
                 node.dirty as i64,
@@ -232,7 +241,7 @@ impl Index {
         let conn = self.db.lock();
         let cutoff = now_ts() - ttl_seconds as i64;
         let mut stmt = conn.prepare(
-            "SELECT path, kind, size, mtime, etag, remote_id, digest, hydrated, dirty, present, fetched_at \
+            "SELECT path, kind, size, mtime, etag, remote_id, docwsid, zone, digest, hydrated, dirty, present, fetched_at \
              FROM nodes WHERE fetched_at < ?1 AND present = 1 ORDER BY fetched_at ASC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![cutoff, limit as i64], row_to_node)?;
@@ -246,7 +255,7 @@ impl Index {
     pub fn all(&self) -> Result<Vec<Node>> {
         let conn = self.db.lock();
         let mut stmt = conn.prepare(
-            "SELECT path, kind, size, mtime, etag, remote_id, digest, hydrated, dirty, present, fetched_at \
+            "SELECT path, kind, size, mtime, etag, remote_id, docwsid, zone, digest, hydrated, dirty, present, fetched_at \
              FROM nodes ORDER BY path",
         )?;
         let rows = stmt.query_map([], row_to_node)?;
@@ -294,10 +303,12 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
         mtime: row.get(3)?,
         etag: row.get(4)?,
         remote_id: row.get(5)?,
-        digest: row.get(6)?,
-        hydrated: row.get::<_, i64>(7)? != 0,
-        dirty: row.get::<_, i64>(8)? != 0,
-        present: row.get::<_, i64>(9)? != 0,
-        fetched_at: row.get(10)?,
+        docwsid: row.get(6)?,
+        zone: row.get(7)?,
+        digest: row.get(8)?,
+        hydrated: row.get::<_, i64>(9)? != 0,
+        dirty: row.get::<_, i64>(10)? != 0,
+        present: row.get::<_, i64>(11)? != 0,
+        fetched_at: row.get(12)?,
     })
 }

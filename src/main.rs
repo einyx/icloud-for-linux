@@ -21,7 +21,7 @@ use tracing_subscriber::EnvFilter;
 use icloud_for_linux::blob::BlobStore;
 use icloud_for_linux::config::Config;
 use icloud_for_linux::db::Db;
-use icloud_for_linux::icloud_api::{ICloudClient, UnimplementedClient};
+use icloud_for_linux::icloud::client::ICloudApi;
 use icloud_for_linux::index::Index;
 use icloud_for_linux::journal::Journal;
 use icloud_for_linux::service;
@@ -163,6 +163,36 @@ fn open_store(config_path: &Path) -> Result<Store> {
     })
 }
 
+/// Build the iCloud client and restore the session.
+///
+/// When the session cannot be restored the client is still returned, in
+/// "unauthenticated" mode: the filesystem mounts and serves the local store,
+/// and the sync engine simply has nothing to talk to.
+fn build_client(config: &Config) -> ICloudApi {
+    let client = ICloudApi::new(
+        &config.username,
+        &config.password,
+        &config.expanded_cookie_dir(),
+        None,
+    )
+    .unwrap_or_else(|e| {
+        tracing::error!(error = %e, "could not create the iCloud client");
+        ICloudApi::new("", "", Path::new("/tmp"), None).expect("a client without a session")
+    });
+    match client.restore() {
+        Ok(()) => {
+            tracing::info!("session restored, the remote is reachable");
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "UNAUTHENTICATED mode: run `icloudctl auth` to sign in again"
+            );
+        }
+    }
+    client
+}
+
 fn cmd_init(mount_dir: Option<PathBuf>) -> Result<()> {
     service::ensure_dirs()?;
     let mount_dir = resolve_mount(mount_dir);
@@ -223,10 +253,7 @@ fn cmd_mount(mount_dir: Option<PathBuf>, config: Option<PathBuf>, foreground: bo
     service::ensure_dirs()?;
     std::fs::create_dir_all(&mount_dir)?;
 
-    let mut client = UnimplementedClient;
-    if let Err(e) = client.authenticate(!foreground) {
-        tracing::warn!(error = %e, "remote unavailable — running against the local store only");
-    }
+    let client = build_client(&store.config);
 
     let engine = Arc::new(SyncEngine::new(
         store.config.clone(),
@@ -240,20 +267,62 @@ fn cmd_mount(mount_dir: Option<PathBuf>, config: Option<PathBuf>, foreground: bo
     }
     let _ = foreground;
 
+    // The background loops: drain the journal and refresh stale metadata.
+    if store.config.auto_sync {
+        let engine = engine.clone();
+        let upload_interval = store.config.upload_interval_seconds.max(5);
+        let refresh_interval = store.config.remote_refresh_interval_seconds.max(30);
+        std::thread::Builder::new()
+            .name("icloud-sync".to_string())
+            .spawn(move || {
+                let mut elapsed = 0u64;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    elapsed += 5;
+                    if elapsed.is_multiple_of(upload_interval) {
+                        match engine.sync_once() {
+                            Ok(report) => {
+                                if report.drained > 0 || report.refreshed > 0 {
+                                    tracing::info!(
+                                        drained = report.drained,
+                                        refreshed = report.refreshed,
+                                        "sync pass finished"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, "sync pass failed"),
+                        }
+                    }
+                    let _ = refresh_interval;
+                }
+            })
+            .ok();
+    }
+
     let hydrate: vfs::HydrateFn = {
         let engine = engine.clone();
         Arc::new(move |path: &str| engine.ensure_local_file(path))
     };
+    let resolve: vfs::ResolveFn = {
+        let engine = engine.clone();
+        Arc::new(move |path: &str| engine.resolve_path(path))
+    };
+    let list: vfs::ListFn = {
+        let engine = engine.clone();
+        Arc::new(move |path: &str| engine.list_dir(path))
+    };
 
     let staging = store.config.expanded_cache_dir().join("staging");
-    let fs = Vfs::new(
-        store.index.clone(),
-        store.journal.clone(),
-        store.blobs.clone(),
-        staging,
-        Some(hydrate),
-        store.config.fuse_options.ro,
-    );
+    let fs = Vfs::new(vfs::VfsParts {
+        index: store.index.clone(),
+        journal: store.journal.clone(),
+        blobs: store.blobs.clone(),
+        staging_dir: staging,
+        hydrate: Some(hydrate),
+        resolve: Some(resolve),
+        list: Some(list),
+        read_only: store.config.fuse_options.ro,
+    });
     let opts = vfs::mount_options(&store.config.fuse_options);
     tracing::info!(mount = %mount_dir.display(), "mounting iCloud Drive");
     vfs::mount(fs, &mount_dir, opts)
@@ -276,8 +345,7 @@ fn cmd_unmount(mount_dir: Option<PathBuf>) -> Result<()> {
 fn cmd_sync(dry_run: bool) -> Result<()> {
     let config_path = resolve_config(None);
     let store = open_store(&config_path)?;
-    let mut client = UnimplementedClient;
-    let _ = client.authenticate(false);
+    let client = build_client(&store.config);
     let engine = SyncEngine::new(
         store.config.clone(),
         store.index.clone(),
@@ -315,8 +383,7 @@ fn cmd_sync(dry_run: bool) -> Result<()> {
 fn cmd_hydrate(dry_run: bool) -> Result<()> {
     let config_path = resolve_config(None);
     let store = open_store(&config_path)?;
-    let mut client = UnimplementedClient;
-    let _ = client.authenticate(false);
+    let client = build_client(&store.config);
     let engine = SyncEngine::new(
         store.config.clone(),
         store.index.clone(),
@@ -397,8 +464,7 @@ fn cmd_verify() -> Result<()> {
 fn cmd_gc() -> Result<()> {
     let config_path = resolve_config(None);
     let store = open_store(&config_path)?;
-    let mut client = UnimplementedClient;
-    let _ = client.authenticate(false);
+    let client = build_client(&store.config);
     let engine = SyncEngine::new(
         store.config.clone(),
         store.index.clone(),
@@ -514,10 +580,13 @@ fn main() -> Result<()> {
             debug,
             accept_terms,
             trust_token,
-        } => {
-            let _ = trust_token;
-            icloud_for_linux::auth::run_auth(&resolve_config(None), force_sms, debug, accept_terms)
-        }
+        } => icloud_for_linux::auth::run_auth(
+            &resolve_config(None),
+            force_sms,
+            debug,
+            accept_terms,
+            trust_token,
+        ),
         Command::Mount {
             mount_dir,
             config,

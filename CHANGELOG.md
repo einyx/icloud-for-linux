@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — the iCloud protocol client
+
+### Added
+
+- **SRP sign-in.** Apple's variant of SRP-6a: the password never leaves the
+  machine. The password is derived with PBKDF2-HMAC-SHA256 over its hash, the
+  salt and the iteration count the service chooses; the username is omitted
+  from `x`, as Apple does.
+- **Two-factor authentication.** The code of a push notification, or a code
+  requested by SMS (`--force-sms`), including the phone numbers of the
+  account.
+- **Session persistence.** Cookies, the session token, the trust token and the
+  service endpoints are stored in `cookie_dir` with owner-only permissions, so
+  a restart resumes without a new code.
+- **Partition detection.** The account's shard is detected once and used for
+  the service endpoints, which avoids the `421` errors.
+- **Drive service.** Resolve a path, list a folder, download, upload (the
+  three step exchange the service expects), create a folder, rename, move and
+  move to the trash.
+- **Lazy resolution through the mount.** `lookup` and `readdir` ask the
+  service for a path the first time it is used, so the index fills as the
+  drive is explored instead of being crawled.
+- **Background sync loop.** While the mount is served, the journal is drained
+  and stale metadata is refreshed on the configured schedule.
+- **Degraded mode.** Without a valid session the driver parks in
+  "unauthenticated" mode: the mount still works and serves the local store.
+- **14 protocol tests**, including an SRP round trip that checks the client
+  proof against a server side computation instead of a recorded value.
+
+### Changed
+
+- The HTTP layer sits behind a `Transport` trait with a cookie jar of our own,
+  so the protocol can be tested against scripted responses and the session can
+  be persisted between runs.
+
 ## [0.2.0] — redesign
 
 The project was rebuilt around a different architecture. The goal is the same

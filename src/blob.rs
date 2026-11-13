@@ -46,6 +46,11 @@ impl BlobStore {
         &self.root
     }
 
+    /// The directory in-flight downloads and uploads are staged in.
+    pub fn staging_dir(&self) -> &Path {
+        &self.staging
+    }
+
     /// Path of a blob inside the store. Does not check existence.
     pub fn path(&self, digest: &str) -> Result<PathBuf> {
         let digest = normalize_digest(digest)?;

@@ -1,13 +1,8 @@
 //! The boundary to the iCloud service.
 //!
 //! Everything above this trait (index, journal, blob store, FUSE surface) is
-//! independent of the wire protocol. The implementation that lives behind it
-//! speaks to Apple's iCloud Drive web service and is the piece that is still
-//! being built out — see `docs/ROADMAP.md`.
-//!
-//! The trait is deliberately path-oriented and stateless: the caller asks
-//! about a path, the client resolves it however it can (cache, request, walk)
-//! and answers with the metadata for that path.
+//! independent of the wire protocol. The implementation behind it lives in
+//! [`crate::icloud`] and speaks to Apple's iCloud Drive web service.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -27,6 +22,10 @@ pub struct RemoteNode {
     pub kind: RemoteKind,
     /// Stable identifier of the node on the server (drivewsid).
     pub remote_id: Option<String>,
+    /// Identifier of the document that carries the content.
+    pub docwsid: Option<String>,
+    /// The zone the document lives in.
+    pub zone: Option<String>,
     /// Version marker of the content, used for conflict detection.
     pub etag: Option<String>,
     pub size: u64,
@@ -64,7 +63,7 @@ pub trait ICloudClient: Send + Sync {
         -> Result<RemoteNode>;
 }
 
-/// Placeholder client used until the protocol implementation lands.
+/// Placeholder client used until a protocol implementation is configured.
 ///
 /// The rest of the system works against the local store, so the filesystem
 /// still mounts and serves cached content; only the remote side is missing.
@@ -73,7 +72,7 @@ pub struct UnimplementedClient;
 impl ICloudClient for UnimplementedClient {
     fn authenticate(&mut self, _interactive: bool) -> Result<()> {
         Err(anyhow!(
-            "the iCloud protocol client is not implemented yet (see docs/ROADMAP.md, milestone M1)"
+            "no iCloud protocol client is configured (see docs/ROADMAP.md, milestone M1)"
         ))
     }
 

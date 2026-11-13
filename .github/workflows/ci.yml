@@ -57,6 +57,9 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          # ring detects the target CPU and passes a cortex-a53 fix flag that
+          # the linker rejects; pin a generic armv8 baseline instead.
+          CFLAGS_aarch64_unknown_linux_gnu: -march=armv8-a
 
   container:
     name: container image

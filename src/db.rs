@@ -48,6 +48,8 @@ impl Db {
                 mtime      INTEGER NOT NULL DEFAULT 0,
                 etag       TEXT,
                 remote_id  TEXT,
+                docwsid    TEXT,
+                zone       TEXT,
                 digest     TEXT,
                 hydrated   INTEGER NOT NULL DEFAULT 0,
                 dirty      INTEGER NOT NULL DEFAULT 0,
@@ -85,6 +87,19 @@ impl Db {
             );
             "#,
         )?;
+        // Columns added after the first release; older databases get them here.
+        for (column, definition) in [("docwsid", "TEXT"), ("zone", "TEXT")] {
+            let mut stmt = conn.prepare("PRAGMA table_info(nodes)")?;
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if !names.iter().any(|n| n == column) {
+                conn.execute(
+                    &format!("ALTER TABLE nodes ADD COLUMN {} {}", column, definition),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 

@@ -19,7 +19,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -32,6 +32,7 @@ use std::time::{Duration, SystemTime};
 use parking_lot::Mutex;
 
 use crate::blob::BlobStore;
+use crate::icloud_api::{RemoteKind, RemoteNode};
 use crate::index::{name_of, parent_of, Index, Node, NodeKind};
 use crate::journal::{Journal, Op};
 
@@ -40,6 +41,12 @@ const ROOT_INO: u64 = 1;
 
 /// Callback used to fetch content that is not local yet.
 pub type HydrateFn = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
+
+/// Callback used to resolve a path that is not in the index yet.
+pub type ResolveFn = Arc<dyn Fn(&str) -> Result<Option<RemoteNode>> + Send + Sync>;
+
+/// Callback used to list a directory that was not listed yet.
+pub type ListFn = Arc<dyn Fn(&str) -> Result<Vec<RemoteNode>> + Send + Sync>;
 
 /// The working copy of one path.
 struct Staged {
@@ -56,30 +63,49 @@ struct Handle {
     file: File,
 }
 
+/// The parts a filesystem is built from.
+pub struct VfsParts {
+    pub index: Arc<Index>,
+    pub journal: Arc<Journal>,
+    pub blobs: Arc<BlobStore>,
+    pub staging_dir: PathBuf,
+    pub hydrate: Option<HydrateFn>,
+    pub resolve: Option<ResolveFn>,
+    pub list: Option<ListFn>,
+    pub read_only: bool,
+}
+
 pub struct Vfs {
     pub index: Arc<Index>,
     pub journal: Arc<Journal>,
     pub blobs: Arc<BlobStore>,
     pub staging_dir: PathBuf,
     pub hydrate: Option<HydrateFn>,
+    pub resolve: Option<ResolveFn>,
+    pub list: Option<ListFn>,
     pub read_only: bool,
     inos: Mutex<HashMap<String, u64>>,
     paths: Mutex<HashMap<u64, String>>,
     next_ino: AtomicU64,
     handles: Mutex<HashMap<u64, Handle>>,
     staged: Mutex<HashMap<String, Staged>>,
+    /// Directories that were listed, so the remote is not asked twice.
+    listed: Mutex<HashSet<String>>,
     next_fh: AtomicU64,
 }
 
 impl Vfs {
-    pub fn new(
-        index: Arc<Index>,
-        journal: Arc<Journal>,
-        blobs: Arc<BlobStore>,
-        staging_dir: PathBuf,
-        hydrate: Option<HydrateFn>,
-        read_only: bool,
-    ) -> Self {
+    pub fn new(parts: VfsParts) -> Self {
+        let VfsParts {
+            index,
+            journal,
+            blobs,
+            staging_dir,
+            hydrate,
+            resolve,
+            list,
+            read_only,
+        } = parts;
         let mut inos = HashMap::new();
         let mut paths = HashMap::new();
         inos.insert("/".to_string(), ROOT_INO);
@@ -90,12 +116,15 @@ impl Vfs {
             blobs,
             staging_dir,
             hydrate,
+            resolve,
+            list,
             read_only,
             inos: Mutex::new(inos),
             paths: Mutex::new(paths),
             next_ino: AtomicU64::new(2),
             handles: Mutex::new(HashMap::new()),
             staged: Mutex::new(HashMap::new()),
+            listed: Mutex::new(HashSet::new()),
             next_fh: AtomicU64::new(1),
         }
     }
@@ -310,6 +339,73 @@ impl Vfs {
         Err(anyhow!("no local content for {}", path))
     }
 
+    /// Resolve a path that is not in the index yet.
+    fn resolve_remote(&self, path: &str) -> Option<Node> {
+        let resolve = self.resolve.as_ref()?;
+        let remote = resolve(path).ok().flatten()?;
+        let mut node = Node::new(
+            path,
+            match remote.kind {
+                RemoteKind::Folder => NodeKind::Folder,
+                RemoteKind::File => NodeKind::File,
+            },
+        );
+        node.remote_id = remote.remote_id;
+        node.docwsid = remote.docwsid;
+        node.zone = remote.zone;
+        node.etag = remote.etag;
+        node.size = remote.size;
+        node.mtime = remote.mtime;
+        node.fetched_at = crate::db::now_ts();
+        if node.kind == NodeKind::Folder {
+            node.hydrated = true;
+        }
+        let _ = self.index.upsert(&node);
+        Some(node)
+    }
+
+    /// List a directory that was not listed yet.
+    fn ensure_listed(&self, path: &str) {
+        {
+            let listed = self.listed.lock();
+            if listed.contains(path) {
+                return;
+            }
+        }
+        let Some(list) = self.list.as_ref() else {
+            return;
+        };
+        let Ok(children) = list(path) else {
+            return;
+        };
+        for child in children {
+            let child_path = if path == "/" {
+                format!("/{}", child.path)
+            } else {
+                format!("{}/{}", path.trim_end_matches('/'), child.path)
+            };
+            let mut node = Node::new(
+                &child_path,
+                match child.kind {
+                    RemoteKind::Folder => NodeKind::Folder,
+                    RemoteKind::File => NodeKind::File,
+                },
+            );
+            node.remote_id = child.remote_id;
+            node.docwsid = child.docwsid;
+            node.zone = child.zone;
+            node.etag = child.etag;
+            node.size = child.size;
+            node.mtime = child.mtime;
+            node.fetched_at = crate::db::now_ts();
+            if node.kind == NodeKind::Folder {
+                node.hydrated = true;
+            }
+            let _ = self.index.upsert(&node);
+        }
+        self.listed.lock().insert(path.to_string());
+    }
+
     /// Drop the working copy of a path (used when the path is removed).
     fn discard_working_copy(&self, path: &str) {
         let entry = self.staged.lock().remove(path);
@@ -327,7 +423,13 @@ impl Filesystem for Vfs {
                 let attr = self.attr_of(&path, Some(&node));
                 reply.entry(&TTL, &attr, 0);
             }
-            None => reply.error(libc::ENOENT),
+            None => match self.resolve_remote(&path) {
+                Some(node) => {
+                    let attr = self.attr_of(&path, Some(&node));
+                    reply.entry(&TTL, &attr, 0);
+                }
+                None => reply.error(libc::ENOENT),
+            },
         }
     }
 
@@ -359,6 +461,7 @@ impl Filesystem for Vfs {
             (ino, FileType::Directory, b".".to_vec()),
             (ino, FileType::Directory, b"..".to_vec()),
         ];
+        self.ensure_listed(&parent);
         match self.index.children(&parent) {
             Ok(children) => {
                 for child in children {

@@ -20,6 +20,7 @@ pub mod auth;
 pub mod blob;
 pub mod config;
 pub mod db;
+pub mod icloud;
 pub mod icloud_api;
 pub mod index;
 pub mod journal;

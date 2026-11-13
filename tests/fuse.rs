@@ -13,7 +13,7 @@ use icloud_for_linux::blob::BlobStore;
 use icloud_for_linux::db::Db;
 use icloud_for_linux::index::Index;
 use icloud_for_linux::journal::Journal;
-use icloud_for_linux::vfs::Vfs;
+use icloud_for_linux::vfs::{Vfs, VfsParts};
 
 fn which(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -35,14 +35,16 @@ fn mount_fs(
     let blobs = Arc::new(BlobStore::new(cache).unwrap());
     let index = Arc::new(Index::new(db.clone()));
     let journal = Arc::new(Journal::new(db));
-    let fs = Vfs::new(
-        index.clone(),
-        journal.clone(),
+    let fs = Vfs::new(VfsParts {
+        index: index.clone(),
+        journal: journal.clone(),
         blobs,
-        cache.join("staging"),
-        None,
-        false,
-    );
+        staging_dir: cache.join("staging"),
+        hydrate: None,
+        resolve: None,
+        list: None,
+        read_only: false,
+    });
     let options = vec![
         fuser::MountOption::FSName("icloud-for-linux-test".to_string()),
         fuser::MountOption::Subtype("icloud-for-linux-test".to_string()),
