@@ -397,8 +397,10 @@ impl Transport for HttpTransport {
                 file_name,
                 content_type,
             } => {
-                let bytes = std::fs::read(path)?;
-                let part = reqwest::blocking::multipart::Part::bytes(bytes)
+                // The file is streamed from disk: a large upload never sits in
+                // memory.
+                let part = reqwest::blocking::multipart::Part::file(path)
+                    .map_err(|e| Error::Transport(e.to_string()))?
                     .file_name(file_name.clone())
                     .mime_str(content_type)
                     .map_err(|e| Error::Transport(e.to_string()))?;

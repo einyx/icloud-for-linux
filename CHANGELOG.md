@@ -5,6 +5,57 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — parity and hardening
+
+### Added
+
+- **The synchronisation boundary is enforced by the mount.** A path outside
+  `sync_paths` (or inside `exclude_paths`) can no longer be created, written,
+  truncated, renamed or deleted: the mount answers `EACCES` and the change is
+  never queued. A rename is refused when the folder holds a path that is
+  excluded — moving it would smuggle it past the rule.
+- **Crash safety.** The working copies are registered, so a restart can find
+  them again. The recovery pass runs before the mount is served: a working
+  copy that a crash left half written is restored from the content store, a
+  local change that was not uploaded yet is committed, and a working copy of
+  an unknown path is dropped.
+- **A flat startup.** The recovery pass compares sizes and only hashes what
+  really changed, so a restart never reads the whole drive — the failure mode
+  that made the previous implementation take minutes and gigabytes of memory
+  at boot.
+- **Extended attributes.** `setxattr`, `getxattr`, `listxattr` and
+  `removexattr` are stored per path and survive a restart.
+- **`fallocate`.** Space can be reserved in a file; the local store keeps such
+  a file sparse instead of filling the store with zeros.
+- **`rename` with flags.** `RENAME_NOREPLACE` refuses an existing target,
+  `RENAME_EXCHANGE` swaps two paths.
+- **A sparse aware blob store.** A file that reserves space without using it
+  is stored as a hole, so the digest is the same and the store stays small.
+- **`icloudctl verify` checks everything.** Blobs are re-hashed, references to
+  missing content are reported, and working copies that do not match the
+  committed content are listed.
+- 22 new tests: the parity scenarios, the hardening scenarios and the kernel
+  operations (fallocate, extended attributes, the rename flags, `fsync`
+  ordering, files larger than four gigabytes, the boundary).
+
+### Fixed
+
+- **The inode follows the file.** When a file is renamed, its inode moves with
+  it; when two files are exchanged, their inodes are swapped. The kernel keeps
+  the inode of a renamed file together with its cached pages — with the number
+  pinned to the path, the kernel could serve the cached pages of the wrong
+  file.
+- **A new file starts empty.** A working copy left over from an earlier run is
+  truncated when the file is created again.
+- **Unchanged content is not hashed twice.** A flush and a release of the same
+  file only commit once.
+- **Uploads stream from disk.** The file is no longer read into memory before
+  it is sent.
+- **An expired session stops the hydration.** The workers wait instead of
+  retrying in a loop, which keeps the account from being throttled.
+- The FUSE protocol version is raised, so the kernel sends the newer
+  operations instead of refusing them.
+
 ## [0.4.0] — background work
 
 ### Added

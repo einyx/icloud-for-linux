@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::icloud::error::Error as ICloudError;
 use crate::signal;
 use crate::sync::SyncEngine;
 
@@ -114,6 +115,16 @@ struct ScheduleState {
     elapsed: u64,
 }
 
+/// Does the failure mean that the session has to be renewed?
+fn is_auth_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ICloudError>()
+            .map(crate::icloud::error::is_auth_error)
+            .unwrap_or(false)
+    })
+}
+
 /// One hydration worker: it claims files and downloads them.
 fn hydration_worker(engine: Arc<SyncEngine>) {
     loop {
@@ -132,8 +143,20 @@ fn hydration_worker(engine: Arc<SyncEngine>) {
             match engine.hydrate_one(&path) {
                 Ok(()) => info!(path = %path, "hydrated"),
                 Err(e) => {
-                    warn!(path = %path, error = %e, "hydration failed");
                     engine.release_claim(&path);
+                    if is_auth_failure(&e) {
+                        // The session expired. Retrying now would only burn
+                        // requests, so the worker waits for the user to sign
+                        // in again.
+                        warn!(
+                            path = %path,
+                            error = %e,
+                            "hydration stopped: the session expired, run `icloudctl auth`"
+                        );
+                        std::thread::sleep(Duration::from_secs(300));
+                        break;
+                    }
+                    warn!(path = %path, error = %e, "hydration failed");
                 }
             }
         }

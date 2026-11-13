@@ -148,6 +148,42 @@ state in step with the remote:
 The signal handler itself only stores a flag — no allocation, no I/O in signal
 context.
 
+## Crash safety
+
+The working copies are mutable, so a crash can leave one half written. They are
+registered in the database, and the recovery pass runs before the mount is
+served:
+
+| State of a working copy | What the recovery does |
+| --- | --- |
+| The path is clean and the size matches | nothing — the content is already in the store |
+| The path is clean and the size differs | restore it from the committed blob |
+| The path has an unuploaded change | commit it to the store, so the change survives |
+| The path is unknown to the index | drop it |
+
+The pass compares sizes and only hashes what really changed. That is what keeps
+the start fast and the memory flat on a drive with tens of gigabytes of
+content.
+
+## The synchronisation boundary
+
+The boundary is enforced by the mount, not only by the sync engine: a path
+outside `sync_paths` (or inside `exclude_paths`) cannot be created, written,
+truncated, renamed or deleted. The kernel gets `EACCES` and nothing is queued
+for upload.
+
+A rename is checked as a whole: moving a folder that contains an excluded path
+is refused, because the move would take the excluded content out of the
+boundary.
+
+## Inodes
+
+The inode number belongs to the file, not to the path. When a file is renamed
+its inode moves with it, and when two files are exchanged their inodes are
+swapped. The kernel keeps the inode of a renamed file together with its cached
+pages — with the number pinned to the path, the kernel could end up serving
+the cached pages of a different file.
+
 ## Concurrency
 
 - The FUSE session runs on its own thread.

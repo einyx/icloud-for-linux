@@ -1,6 +1,6 @@
 [package]
 name = "icloud-for-linux"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["einyx"]
 description = "Mount iCloud Drive on Linux as a local-first FUSE filesystem with persistent caching and sync"
@@ -30,7 +30,10 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac", "sha2
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "multipart", "json", "rustls-tls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 # Pure-Rust FUSE: no libfuse headers required, talks to /dev/fuse directly.
-fuser = { version = "0.14", default-features = false }
+# The ABI features raise the negotiated protocol version, which is what makes
+# the kernel send the newer operations (fallocate, extended attributes and
+# the rename flags).
+fuser = { version = "0.14", default-features = false, features = ["abi-7-31"] }
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -46,6 +49,7 @@ shellexpand = "3"
 # dependencies until it is actually needed.
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 lto = true

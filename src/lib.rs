@@ -30,3 +30,5 @@ pub mod service;
 pub mod signal;
 pub mod sync;
 pub mod vfs;
+pub mod working;
+pub mod xattr;

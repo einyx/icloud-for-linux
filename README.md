@@ -231,6 +231,19 @@ Layout:
 - `Makefile` — the single entry point for every workflow
 - `.github/workflows/` — CI (fmt/clippy/test, multi-arch build, container) and release publishing
 
+## Recovery and verification
+
+The local store survives a crash. When the driver starts, it reconciles the
+working copies with the content store: a file that was half written is
+restored, a local change that was not uploaded yet is committed, and leftovers
+of files that no longer exist are removed. The pass compares sizes and only
+hashes what really changed, so a restart does not read the whole drive.
+
+```bash
+icloudctl verify   # re-hash every blob, report missing or inconsistent content
+icloudctl gc       # remove the blobs nothing refers to any more
+```
+
 ## Troubleshooting
 
 **The service will not start**

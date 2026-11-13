@@ -17,7 +17,7 @@
 use anyhow::{anyhow, Result};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -35,6 +35,8 @@ use crate::blob::BlobStore;
 use crate::icloud_api::{RemoteKind, RemoteNode};
 use crate::index::{name_of, parent_of, Index, Node, NodeKind};
 use crate::journal::{Journal, Op};
+use crate::working::WorkingCopies;
+use crate::xattr::Xattrs;
 
 const TTL: Duration = Duration::from_secs(60);
 const ROOT_INO: u64 = 1;
@@ -48,12 +50,23 @@ pub type ResolveFn = Arc<dyn Fn(&str) -> Result<Option<RemoteNode>> + Send + Syn
 /// Callback used to list a directory that was not listed yet.
 pub type ListFn = Arc<dyn Fn(&str) -> Result<Vec<RemoteNode>> + Send + Sync>;
 
+/// Callback that decides whether a path may be changed at all.
+///
+/// The synchronisation boundary is a hard limit: a path outside it cannot be
+/// written, and the change is never queued for upload.
+pub type BoundaryFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// The working copy of one path.
 struct Staged {
     /// File in the staging directory.
     file: PathBuf,
     /// Current length of the working copy.
     size: u64,
+    /// The length that was committed last, so unchanged content is not
+    /// hashed again.
+    committed_size: u64,
+    /// Whether the working copy changed since the last commit.
+    dirty: bool,
 }
 
 /// An open file handle: the path it serves and its own descriptor on the
@@ -67,22 +80,28 @@ struct Handle {
 pub struct VfsParts {
     pub index: Arc<Index>,
     pub journal: Arc<Journal>,
+    pub working: Arc<WorkingCopies>,
+    pub xattrs: Arc<Xattrs>,
     pub blobs: Arc<BlobStore>,
     pub staging_dir: PathBuf,
     pub hydrate: Option<HydrateFn>,
     pub resolve: Option<ResolveFn>,
     pub list: Option<ListFn>,
+    pub boundary: Option<BoundaryFn>,
     pub read_only: bool,
 }
 
 pub struct Vfs {
     pub index: Arc<Index>,
     pub journal: Arc<Journal>,
+    pub working: Arc<WorkingCopies>,
+    pub xattrs: Arc<Xattrs>,
     pub blobs: Arc<BlobStore>,
     pub staging_dir: PathBuf,
     pub hydrate: Option<HydrateFn>,
     pub resolve: Option<ResolveFn>,
     pub list: Option<ListFn>,
+    pub boundary: Option<BoundaryFn>,
     pub read_only: bool,
     inos: Mutex<HashMap<String, u64>>,
     paths: Mutex<HashMap<u64, String>>,
@@ -99,11 +118,14 @@ impl Vfs {
         let VfsParts {
             index,
             journal,
+            working,
+            xattrs,
             blobs,
             staging_dir,
             hydrate,
             resolve,
             list,
+            boundary,
             read_only,
         } = parts;
         let mut inos = HashMap::new();
@@ -113,11 +135,14 @@ impl Vfs {
         Self {
             index,
             journal,
+            working,
+            xattrs,
             blobs,
             staging_dir,
             hydrate,
             resolve,
             list,
+            boundary,
             read_only,
             inos: Mutex::new(inos),
             paths: Mutex::new(paths),
@@ -142,6 +167,34 @@ impl Vfs {
 
     fn path_for(&self, ino: u64) -> Option<String> {
         self.paths.lock().get(&ino).cloned()
+    }
+
+    /// Move the inode of a path along with it.
+    ///
+    /// The kernel keeps the inode (and its cached pages) of a file when it is
+    /// renamed. If the number stayed with the path, the kernel would see a
+    /// different inode and lose the cache — and, worse, could serve the
+    /// cached pages of the wrong file.
+    fn move_inode(&self, old_path: &str, new_path: &str) {
+        let Some(ino) = self.inos.lock().remove(old_path) else {
+            return;
+        };
+        self.paths.lock().insert(ino, new_path.to_string());
+        self.inos.lock().insert(new_path.to_string(), ino);
+    }
+
+    /// Swap the inodes of two paths.
+    fn swap_inodes(&self, first: &str, second: &str) {
+        let first_ino = self.inos.lock().get(first).copied();
+        let second_ino = self.inos.lock().get(second).copied();
+        if let Some(ino) = first_ino {
+            self.paths.lock().insert(ino, second.to_string());
+            self.inos.lock().insert(second.to_string(), ino);
+        }
+        if let Some(ino) = second_ino {
+            self.paths.lock().insert(ino, first.to_string());
+            self.inos.lock().insert(first.to_string(), ino);
+        }
     }
 
     fn path_of(&self, parent: u64, name: &OsStr) -> String {
@@ -261,6 +314,8 @@ impl Vfs {
             Staged {
                 file: working.clone(),
                 size,
+                committed_size: usize::MAX as u64,
+                dirty: true,
             },
         );
         Ok(working)
@@ -282,8 +337,18 @@ impl Vfs {
             return Ok(());
         }
         let size = std::fs::metadata(&working)?.len();
-        let mut reader = File::open(&working)?;
-        let digest = self.blobs.put_reader(&mut reader)?;
+        {
+            // Nothing changed since the last commit: the content is already in
+            // the store, and hashing it again would be wasted work.
+            let staged = self.staged.lock();
+            let key = path.to_string();
+            if let Some(entry) = staged.get(&key) {
+                if !entry.dirty && entry.committed_size == size {
+                    return Ok(());
+                }
+            }
+        }
+        let digest = self.blobs.put_file(&working)?;
 
         let mut node = self
             .index
@@ -404,12 +469,70 @@ impl Vfs {
         self.listed.lock().insert(path.to_string());
     }
 
+    /// Is the path inside the synchronisation boundary?
+    fn allowed(&self, path: &str) -> bool {
+        match &self.boundary {
+            Some(boundary) => boundary(path),
+            None => true,
+        }
+    }
+
+    /// May this path be changed?
+    ///
+    /// A directory may only be moved when every path below it is allowed as
+    /// well: moving an excluded folder out of the boundary would smuggle it
+    /// past the rule.
+    fn may_modify(&self, path: &str) -> bool {
+        if !self.allowed(path) {
+            return false;
+        }
+        if let Ok(descendants) = self.index.descendants(path) {
+            if descendants.iter().any(|node| !self.allowed(&node.path)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Swap two paths, used by `rename` with `RENAME_EXCHANGE`.
+    fn swap_paths(&self, first: &str, second: &str) -> Result<()> {
+        let first_working = self.working_copy(first);
+        let second_working = self.working_copy(second);
+        let temporary = self.staging_dir.join("exchange.tmp");
+        let _ = std::fs::remove_file(&temporary);
+        if first_working.exists() {
+            std::fs::rename(&first_working, &temporary)?;
+        }
+        if second_working.exists() {
+            std::fs::rename(&second_working, &first_working)?;
+        }
+        if temporary.exists() {
+            std::fs::rename(&temporary, &second_working)?;
+        }
+        let _ = self.working.forget(first);
+        let _ = self.working.forget(second);
+        let _ = self.working.register(first, &first_working);
+        let _ = self.working.register(second, &second_working);
+        // The two files change places, so their inodes do as well.
+        self.swap_inodes(first, second);
+
+        // The index is swapped through a temporary name, so the two subtrees
+        // do not overwrite each other on the way.
+        // A name that cannot collide with a real path.
+        let placeholder = format!("{}.exchange-placeholder", first);
+        self.index.rename_subtree(first, &placeholder)?;
+        self.index.rename_subtree(second, first)?;
+        self.index.rename_subtree(&placeholder, second)?;
+        Ok(())
+    }
+
     /// Drop the working copy of a path (used when the path is removed).
     fn discard_working_copy(&self, path: &str) {
         let entry = self.staged.lock().remove(path);
         if let Some(entry) = entry {
             let _ = std::fs::remove_file(entry.file);
         }
+        let _ = self.working.forget(path);
     }
 }
 
@@ -440,7 +563,9 @@ impl Filesystem for Vfs {
         }
         match self.node_for(&path) {
             Some(node) => reply.attr(&TTL, &self.attr_of(&path, Some(&node))),
-            None => reply.error(libc::ENOENT),
+            None => {
+                reply.error(libc::ENOENT);
+            }
         }
     }
 
@@ -562,6 +687,9 @@ impl Filesystem for Vfs {
         let Some(path) = self.path_for(ino) else {
             return reply.error(libc::ENOENT);
         };
+        if !self.allowed(&path) {
+            return reply.error(libc::EACCES);
+        }
         let mut handles = self.handles.lock();
         let Some(handle) = handles.get_mut(&fh) else {
             return reply.error(libc::EBADF);
@@ -585,6 +713,7 @@ impl Filesystem for Vfs {
             if end > entry.size {
                 entry.size = end;
             }
+            entry.dirty = true;
         }
         // Keep the index size in step with the working copy so that a stat
         // right after the write is accurate.
@@ -668,6 +797,9 @@ impl Filesystem for Vfs {
             return reply.error(libc::EROFS);
         }
         let path = self.path_of(parent, name);
+        if !self.may_modify(&path) {
+            return reply.error(libc::EACCES);
+        }
         let mut node = Node::new(&path, NodeKind::File);
         node.dirty = true;
         node.hydrated = true;
@@ -680,10 +812,21 @@ impl Filesystem for Vfs {
             tracing::error!(path = %path, error = %e, "journal enqueue failed");
             return reply.error(libc::EIO);
         }
+        let __started = std::time::Instant::now();
         let working = match self.ensure_working_copy(&path) {
             Ok(p) => p,
             Err(_) => return reply.error(libc::EIO),
         };
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/opencode/create-timing.log")
+            {
+                writeln!(f, "create working copy: {:?}", __started.elapsed()).unwrap();
+            }
+        }
         let file = match OpenOptions::new().read(true).write(true).open(&working) {
             Ok(f) => f,
             Err(_) => return reply.error(libc::EIO),
@@ -713,6 +856,9 @@ impl Filesystem for Vfs {
             return reply.error(libc::EROFS);
         }
         let path = self.path_of(parent, name);
+        if !self.may_modify(&path) {
+            return reply.error(libc::EACCES);
+        }
         let mut node = Node::new(&path, NodeKind::Folder);
         node.dirty = true;
         node.hydrated = true;
@@ -733,6 +879,9 @@ impl Filesystem for Vfs {
         if self.node_for(&path).is_none() {
             return reply.error(libc::ENOENT);
         }
+        if !self.may_modify(&path) {
+            return reply.error(libc::EACCES);
+        }
         self.discard_working_copy(&path);
         let _ = self.index.set_present(&path, false);
         let _ = self.journal.enqueue(Op::Remove, &path, None, None, None);
@@ -747,6 +896,9 @@ impl Filesystem for Vfs {
         if self.node_for(&path).is_none() {
             return reply.error(libc::ENOENT);
         }
+        if !self.may_modify(&path) {
+            return reply.error(libc::EACCES);
+        }
         self.discard_working_copy(&path);
         let _ = self.index.remove_subtree(&path);
         let _ = self.journal.enqueue(Op::Remove, &path, None, None, None);
@@ -760,7 +912,7 @@ impl Filesystem for Vfs {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
-        _flags: u32,
+        flags: u32,
         reply: ReplyEmpty,
     ) {
         if self.read_only {
@@ -771,20 +923,47 @@ impl Filesystem for Vfs {
         if self.node_for(&old_path).is_none() {
             return reply.error(libc::ENOENT);
         }
+        if !self.may_modify(&old_path) || !self.may_modify(&new_path) {
+            return reply.error(libc::EACCES);
+        }
+        // RENAME_NOREPLACE: the target must not exist.
+        if flags & libc::RENAME_NOREPLACE != 0 && self.node_for(&new_path).is_some() {
+            return reply.error(libc::EEXIST);
+        }
+        // RENAME_EXCHANGE: the two paths swap places.
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            if self.node_for(&new_path).is_none() {
+                return reply.error(libc::ENOENT);
+            }
+            if let Err(e) = self.swap_paths(&old_path, &new_path) {
+                tracing::error!(old = %old_path, new = %new_path, error = %e, "exchange failed");
+                return reply.error(libc::EIO);
+            }
+            return reply.ok();
+        }
+
         // Move the working copy along with the index entry.
         if let Ok(working) = self.ensure_working_copy(&old_path) {
             let target = self.working_copy(&new_path);
             let _ = std::fs::rename(&working, &target);
             let size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
             self.staged.lock().remove(&old_path);
-            self.staged
-                .lock()
-                .insert(new_path.clone(), Staged { file: target, size });
+            self.staged.lock().insert(
+                new_path.clone(),
+                Staged {
+                    file: target,
+                    size,
+                    committed_size: usize::MAX as u64,
+                    dirty: true,
+                },
+            );
         }
         if let Err(e) = self.index.rename_subtree(&old_path, &new_path) {
             tracing::error!(old = %old_path, new = %new_path, error = %e, "rename failed");
             return reply.error(libc::EIO);
         }
+        // The inode follows the file, so the kernel keeps its cache.
+        self.move_inode(&old_path, &new_path);
         let _ = self
             .journal
             .enqueue(Op::Rename, &new_path, Some(&old_path), None, None);
@@ -813,6 +992,9 @@ impl Filesystem for Vfs {
             return reply.error(libc::ENOENT);
         };
         if let Some(size) = size {
+            if !self.allowed(&path) {
+                return reply.error(libc::EACCES);
+            }
             if let Some(node) = self.node_for(&path) {
                 if node.kind == NodeKind::File {
                     // Truncation: cut the working copy too, so the next write
@@ -841,6 +1023,184 @@ impl Filesystem for Vfs {
             Some(node) => reply.attr(&TTL, &self.attr_of(&path, Some(&node))),
             None => reply.error(libc::ENOENT),
         }
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let Some(path) = self.path_for(ino) else {
+            return reply.error(libc::ENOENT);
+        };
+        if !self.allowed(&path) {
+            return reply.error(libc::EACCES);
+        }
+        let name = name.to_string_lossy().to_string();
+        if let Err(e) = self.xattrs.set(&path, &name, value) {
+            tracing::error!(path = %path, error = %e, "could not store the attribute");
+            return reply.error(libc::EIO);
+        }
+        reply.ok();
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        let Some(path) = self.path_for(ino) else {
+            return reply.error(libc::ENOENT);
+        };
+        let name = name.to_string_lossy().to_string();
+        match self.xattrs.get(&path, &name) {
+            Ok(Some(value)) => {
+                if size == 0 {
+                    reply.size(value.len() as u32);
+                } else if size < value.len() as u32 {
+                    reply.error(libc::ERANGE);
+                } else {
+                    reply.data(&value);
+                }
+            }
+            Ok(None) => reply.error(libc::ENODATA),
+            Err(e) => {
+                tracing::error!(path = %path, error = %e, "could not read the attribute");
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        let Some(path) = self.path_for(ino) else {
+            return reply.error(libc::ENOENT);
+        };
+        match self.xattrs.list(&path) {
+            Ok(names) => {
+                let mut data = Vec::new();
+                for name in names {
+                    data.extend_from_slice(name.as_bytes());
+                    data.push(0);
+                }
+                if size == 0 {
+                    reply.size(data.len() as u32);
+                } else if size < data.len() as u32 {
+                    reply.error(libc::ERANGE);
+                } else {
+                    reply.data(&data);
+                }
+            }
+            Err(e) => {
+                tracing::error!(path = %path, error = %e, "could not list the attributes");
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(path) = self.path_for(ino) else {
+            return reply.error(libc::ENOENT);
+        };
+        let name = name.to_string_lossy().to_string();
+        match self.xattrs.remove(&path, &name) {
+            Ok(true) => reply.ok(),
+            Ok(false) => reply.error(libc::ENODATA),
+            Err(e) => {
+                tracing::error!(path = %path, error = %e, "could not remove the attribute");
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    /// Allocate space in a file without writing to it.
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let __t = std::time::Instant::now();
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/opencode/handler-timing.log")
+            {
+                writeln!(
+                    f,
+                    "fallocate enter offset={offset} length={length} mode={mode}"
+                )
+                .unwrap();
+            }
+        }
+        let Some(path) = self.path_for(ino) else {
+            return reply.error(libc::ENOENT);
+        };
+        if !self.allowed(&path) {
+            return reply.error(libc::EACCES);
+        }
+        if offset < 0 || length < 0 {
+            return reply.error(libc::EINVAL);
+        }
+        let working = match self.ensure_working_copy(&path) {
+            Ok(working) => working,
+            Err(_) => return reply.error(libc::EIO),
+        };
+        let end = offset as u64 + length as u64;
+        let file = match OpenOptions::new().write(true).open(&working) {
+            Ok(file) => file,
+            Err(_) => return reply.error(libc::EIO),
+        };
+        if file.set_len(end).is_err() {
+            return reply.error(libc::EIO);
+        }
+        // FALLOC_FL_KEEP_SIZE reserves the space without changing the size.
+        if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
+            let mut staged = self.staged.lock();
+            if let Some(entry) = staged.get_mut(&path) {
+                if end > entry.size {
+                    entry.size = end;
+                }
+            }
+            drop(staged);
+            if let Ok(Some(mut node)) = self.index.get(&path) {
+                if node.size < end {
+                    node.size = end;
+                    node.dirty = true;
+                    let _ = self.index.upsert(&node);
+                }
+            }
+        }
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/opencode/handler-timing.log")
+            {
+                writeln!(
+                    f,
+                    "fallocate done {:?} end={}",
+                    __t.elapsed(),
+                    offset as u64 + length as u64
+                )
+                .unwrap();
+            }
+        }
+        reply.ok();
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {

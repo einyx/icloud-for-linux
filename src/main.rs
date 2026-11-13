@@ -27,6 +27,8 @@ use icloud_for_linux::journal::Journal;
 use icloud_for_linux::service;
 use icloud_for_linux::sync::SyncEngine;
 use icloud_for_linux::vfs::{self, Vfs};
+use icloud_for_linux::working::WorkingCopies;
+use icloud_for_linux::xattr::Xattrs;
 
 #[derive(Parser)]
 #[command(
@@ -159,6 +161,8 @@ struct Store {
     blobs: Arc<BlobStore>,
     index: Arc<Index>,
     journal: Arc<Journal>,
+    working: Arc<WorkingCopies>,
+    xattrs: Arc<Xattrs>,
 }
 
 fn open_store(config_path: &Path) -> Result<Store> {
@@ -168,11 +172,15 @@ fn open_store(config_path: &Path) -> Result<Store> {
     let blobs = Arc::new(BlobStore::new(&cache)?);
     let index = Arc::new(Index::new(db.clone()));
     let journal = Arc::new(Journal::new(db.clone()));
+    let working = Arc::new(WorkingCopies::new(db.clone()));
+    let xattrs = Arc::new(Xattrs::new(db.clone()));
     Ok(Store {
         config,
         blobs,
         index,
         journal,
+        working,
+        xattrs,
     })
 }
 
@@ -273,10 +281,25 @@ fn cmd_mount(mount_dir: Option<PathBuf>, config: Option<PathBuf>, foreground: bo
         store.index.clone(),
         store.journal.clone(),
         store.blobs.clone(),
+        store.working.clone(),
         Box::new(client),
     ));
     if let Err(e) = engine.start() {
         tracing::warn!(error = %e, "sync engine start failed");
+    }
+    // Reconcile the working copies with the content store before anything is
+    // served: a crash can leave a working copy half written.
+    match engine.recover() {
+        Ok(report) if report.restored > 0 || report.committed > 0 || report.removed > 0 => {
+            tracing::info!(
+                restored = report.restored,
+                committed = report.committed,
+                removed = report.removed,
+                "recovered the working copies"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "the recovery pass failed"),
     }
     let _ = foreground;
 
@@ -303,14 +326,27 @@ fn cmd_mount(mount_dir: Option<PathBuf>, config: Option<PathBuf>, foreground: bo
     };
 
     let staging = store.config.expanded_cache_dir().join("staging");
+    // The synchronisation boundary is a hard limit on the mount itself.
+    let boundary_config = store.config.clone();
+    let boundary: vfs::BoundaryFn = Arc::new(move |path: &str| {
+        icloud_for_linux::config::path_allowed(
+            path,
+            boundary_config.sync_paths.as_deref(),
+            &boundary_config.exclude_paths,
+        )
+    });
+
     let fs = Vfs::new(vfs::VfsParts {
         index: store.index.clone(),
         journal: store.journal.clone(),
+        working: store.working.clone(),
+        xattrs: store.xattrs.clone(),
         blobs: store.blobs.clone(),
         staging_dir: staging,
         hydrate: Some(hydrate),
         resolve: Some(resolve),
         list: Some(list),
+        boundary: Some(boundary),
         read_only: store.config.fuse_options.ro,
     });
     let opts = vfs::mount_options(&store.config.fuse_options);
@@ -341,6 +377,7 @@ fn cmd_sync(dry_run: bool, timeout: u64) -> Result<()> {
         store.index.clone(),
         store.journal.clone(),
         store.blobs.clone(),
+        store.working.clone(),
         Box::new(client),
     );
 
@@ -464,6 +501,7 @@ fn cmd_hydrate(dry_run: bool, path: Option<String>) -> Result<()> {
         store.index.clone(),
         store.journal.clone(),
         store.blobs.clone(),
+        store.working.clone(),
         Box::new(client),
     );
     let (pending, done) = match &path {
@@ -529,22 +567,49 @@ fn cmd_export(path: String, dest: PathBuf) -> Result<()> {
 fn cmd_verify() -> Result<()> {
     let config_path = resolve_config(None);
     let store = open_store(&config_path)?;
+    let client = build_client(&store.config);
+    let engine = SyncEngine::new(
+        store.config.clone(),
+        store.index.clone(),
+        store.journal.clone(),
+        store.blobs.clone(),
+        store.working.clone(),
+        Box::new(client),
+    );
+
+    // 1. Every blob must hash to its own name.
     let digests = store.blobs.list()?;
-    let mut bad = 0;
+    let mut corrupt = 0;
     for digest in &digests {
         if !store.blobs.verify(digest)? {
-            println!("CORRUPT: {digest}");
-            bad += 1;
+            println!("CORRUPT blob: {digest}");
+            corrupt += 1;
         }
     }
+
+    // 2. Every blob the index refers to must be there.
+    let dangling = engine.dangling_references()?;
+    for path in &dangling {
+        println!("MISSING content: {path}");
+    }
+
+    // 3. Every working copy must match the committed content.
+    let inconsistent = engine.inconsistent_working_copies()?;
+    for path in &inconsistent {
+        println!("INCONSISTENT working copy: {path}");
+    }
+
+    println!();
     println!(
-        "Checked {} blob(s), {} corrupt, {} byte(s) on disk",
+        "Checked {} blob(s), {} corrupt, {} missing, {} inconsistent, {} byte(s) on disk",
         digests.len(),
-        bad,
+        corrupt,
+        dangling.len(),
+        inconsistent.len(),
         store.blobs.total_size()?
     );
-    if bad > 0 {
-        anyhow::bail!("{} corrupt blob(s)", bad);
+    if corrupt > 0 || !dangling.is_empty() || !inconsistent.is_empty() {
+        anyhow::bail!("the local store is not consistent");
     }
     Ok(())
 }
@@ -558,6 +623,7 @@ fn cmd_gc() -> Result<()> {
         store.index.clone(),
         store.journal.clone(),
         store.blobs.clone(),
+        store.working.clone(),
         Box::new(client),
     );
     let live = engine.live_digests()?;

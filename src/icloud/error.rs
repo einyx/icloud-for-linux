@@ -78,3 +78,14 @@ impl From<serde_json::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Does the error mean that the session has to be renewed?
+///
+/// Retrying such an error in a tight loop only burns requests and can get the
+/// account throttled, so the caller has to back off instead.
+pub fn is_auth_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::AuthRequired | Error::InvalidCredentials | Error::TwoFactorRequired
+    )
+}

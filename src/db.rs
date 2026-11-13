@@ -77,6 +77,22 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_ops_state ON ops(state, created_at);
 
+            -- The working copies: the mutable files the kernel reads and writes.
+            CREATE TABLE IF NOT EXISTS working (
+                path       TEXT PRIMARY KEY,
+                file       TEXT NOT NULL,
+                size       INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- Extended attributes of the paths.
+            CREATE TABLE IF NOT EXISTS xattrs (
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                value BLOB NOT NULL,
+                PRIMARY KEY (path, name)
+            );
+
             -- Versions that lost a conflict, preserved as blob references.
             CREATE TABLE IF NOT EXISTS conflicts (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -20,7 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 /// Hex-encoded SHA-256 digest of a blob.
@@ -115,6 +115,48 @@ impl BlobStore {
         }
         self.ensure_parent(&target)?;
         self.commit(&tmp, &target)?;
+        Ok(digest)
+    }
+
+    /// Store a file, keeping it sparse.
+    ///
+    /// A file that reserves a lot of space without using it (a file that was
+    /// `fallocate`d, for example) would otherwise fill the store with zeros.
+    /// Blocks that are entirely zero are skipped, so the blob stays sparse and
+    /// the content is unchanged.
+    pub fn put_file(&self, path: &Path) -> Result<String> {
+        const BLOCK: usize = 64 * 1024;
+        let mut source = File::open(path)?;
+        let mut hasher = Sha256::new();
+        let tmp = self.staging_file()?;
+        let mut target = File::create(&tmp)?;
+        let mut offset: u64 = 0;
+        let mut buffer = vec![0u8; BLOCK];
+        loop {
+            let read = read_full(&mut source, &mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            if buffer[..read].iter().all(|byte| *byte == 0) {
+                // A hole: skip the data instead of writing it.
+                offset += read as u64;
+                target.seek(std::io::SeekFrom::Start(offset))?;
+            } else {
+                target.write_all(&buffer[..read])?;
+                offset += read as u64;
+            }
+        }
+        target.sync_all()?;
+        drop(target);
+        let digest = hex::encode(hasher.finalize());
+        let final_path = self.path(&digest)?;
+        if final_path.is_file() {
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(digest);
+        }
+        self.ensure_parent(&final_path)?;
+        self.commit(&tmp, &final_path)?;
         Ok(digest)
     }
 
@@ -250,6 +292,18 @@ impl BlobStore {
             }
         }
     }
+}
+
+/// Read as much as possible into the buffer, returning the number of bytes.
+fn read_full(source: &mut File, buffer: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match source.read(&mut buffer[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
 }
 
 fn shard_name(shard: &Path) -> String {

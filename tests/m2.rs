@@ -170,6 +170,8 @@ struct Harness {
     index: Arc<Index>,
     journal: Arc<Journal>,
     blobs: Arc<BlobStore>,
+    #[allow(dead_code)]
+    working: Arc<icloud_for_linux::working::WorkingCopies>,
     staging: PathBuf,
 }
 
@@ -179,7 +181,7 @@ fn harness() -> Harness {
     let db = Arc::new(Db::open(&cache.join("state.sqlite3")).unwrap());
     let blobs = Arc::new(BlobStore::new(&cache).unwrap());
     let index = Arc::new(Index::new(db.clone()));
-    let journal = Arc::new(Journal::new(db));
+    let journal = Arc::new(Journal::new(db.clone()));
     let client = Arc::new(FakeClient::new());
 
     let config = Config {
@@ -188,11 +190,13 @@ fn harness() -> Harness {
         ..Config::default()
     };
 
+    let working = Arc::new(icloud_for_linux::working::WorkingCopies::new(db.clone()));
     let engine = SyncEngine::new(
         config,
         index.clone(),
         journal.clone(),
         blobs.clone(),
+        working.clone(),
         Box::new(FakeClientAdapter(client.clone())),
     );
     Harness {
@@ -203,6 +207,7 @@ fn harness() -> Harness {
         index,
         journal,
         blobs,
+        working,
     }
 }
 

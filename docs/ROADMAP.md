@@ -20,6 +20,9 @@ Status and plan for `icloud-for-linux`.
 | Background drain/refresh loops | ✅ Done | `src/main.rs` — the sync loop runs while the mount is served |
 | Conflict resolution end to end | ✅ Done | the local version is kept as a blob and recorded |
 | On-demand sync over `SIGUSR1` | ✅ Done | the driver writes a completion marker |
+| The boundary is enforced by the mount | ✅ Done | out-of-scope changes fail with `EACCES` |
+| Crash safety and recovery | ✅ Done | the working copies are reconciled at startup |
+| Kernel edge cases | ✅ Done | `fallocate`, xattrs, the rename flags, large files |
 | Background hydration | ✅ Done | a small worker pool, one worker by default |
 | Conflict export | ✅ Done | `icloudctl conflicts`, `icloudctl export-conflicts` |
 | Lazy resolution through the mount | ✅ Done | `lookup`/`readdir` resolve through the client on demand |

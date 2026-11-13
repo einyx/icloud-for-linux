@@ -34,15 +34,20 @@ fn mount_fs(
     let db = Arc::new(Db::open(&cache.join("state.sqlite3")).unwrap());
     let blobs = Arc::new(BlobStore::new(cache).unwrap());
     let index = Arc::new(Index::new(db.clone()));
-    let journal = Arc::new(Journal::new(db));
+    let journal = Arc::new(Journal::new(db.clone()));
+    let working = Arc::new(icloud_for_linux::working::WorkingCopies::new(db.clone()));
+    let xattrs = Arc::new(icloud_for_linux::xattr::Xattrs::new(db.clone()));
     let fs = Vfs::new(VfsParts {
         index: index.clone(),
         journal: journal.clone(),
+        working: working.clone(),
+        xattrs: xattrs.clone(),
         blobs,
         staging_dir: cache.join("staging"),
         hydrate: None,
         resolve: None,
         list: None,
+        boundary: None,
         read_only: false,
     });
     let options = vec![

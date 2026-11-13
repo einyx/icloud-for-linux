@@ -266,6 +266,24 @@ impl Index {
         Ok(out)
     }
 
+    /// Every node below a path.
+    pub fn descendants(&self, path: &str) -> Result<Vec<Node>> {
+        let conn = self.db.lock();
+        let mut stmt = conn.prepare(
+            "SELECT path, kind, size, mtime, etag, remote_id, docwsid, zone, digest, hydrated, dirty, present, fetched_at \
+             FROM nodes WHERE path LIKE ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(
+            params![format!("{}/%", path.trim_end_matches('/'))],
+            row_to_node,
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Digests referenced by the index — the roots the blob GC must keep.
     pub fn referenced_digests(&self) -> Result<std::collections::HashSet<String>> {
         let conn = self.db.lock();

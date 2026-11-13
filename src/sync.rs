@@ -15,6 +15,7 @@
 
 use anyhow::{anyhow, Result};
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -24,12 +25,14 @@ use crate::db::now_ts;
 use crate::icloud_api::{ICloudClient, RemoteKind, RemoteNode};
 use crate::index::{name_of, parent_of, Index, Node, NodeKind};
 use crate::journal::{Journal, Op};
+use crate::working::WorkingCopies;
 
 pub struct SyncEngine {
     pub config: Config,
     pub index: Arc<Index>,
     pub journal: Arc<Journal>,
     pub blobs: Arc<BlobStore>,
+    pub working: Arc<WorkingCopies>,
     pub client: Box<dyn ICloudClient>,
     /// Paths a hydrator is already working on.
     claimed: parking_lot::Mutex<std::collections::HashSet<String>>,
@@ -41,6 +44,7 @@ impl SyncEngine {
         index: Arc<Index>,
         journal: Arc<Journal>,
         blobs: Arc<BlobStore>,
+        working: Arc<WorkingCopies>,
         client: Box<dyn ICloudClient>,
     ) -> Self {
         Self {
@@ -48,6 +52,7 @@ impl SyncEngine {
             index,
             journal,
             blobs,
+            working,
             client,
             claimed: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
@@ -312,6 +317,108 @@ impl SyncEngine {
         Ok(refreshed)
     }
 
+    // ─────────────────────────── recovery ─────────────────────────────
+
+    /// Reconcile the working copies with the content store.
+    ///
+    /// A working copy is mutable, so a crash can leave it half written. The
+    /// pass is deliberately cheap: a file whose size matches the committed
+    /// content is left alone and only the paths that really changed are
+    /// hashed. That keeps the start fast and the memory flat, even on a
+    /// drive with tens of gigabytes of content.
+    pub fn recover(&self) -> Result<RecoveryReport> {
+        let mut report = RecoveryReport::default();
+        for entry in self.working.list()? {
+            if !entry.file.exists() {
+                // The working copy is gone; the committed blob is the truth.
+                self.working.forget(&entry.path)?;
+                report.removed += 1;
+                continue;
+            }
+            let Some(node) = self.index.get(&entry.path)? else {
+                // The path is unknown to the index: drop the working copy.
+                let _ = std::fs::remove_file(&entry.file);
+                self.working.forget(&entry.path)?;
+                report.removed += 1;
+                continue;
+            };
+            if node.dirty {
+                // A local change that was not uploaded yet: commit it, so it
+                // survives the restart.
+                let size = std::fs::metadata(&entry.file)?.len();
+                self.commit_local(&entry.path)?;
+                report.committed += 1;
+                report.hashed_bytes += size;
+                continue;
+            }
+            // The path is clean: the working copy has to match the content
+            // that was committed.
+            let actual = std::fs::metadata(&entry.file)?.len();
+            if actual == node.size {
+                continue;
+            }
+            match node.digest.as_ref() {
+                Some(digest) if self.blobs.contains(digest) => {
+                    self.restore_working_copy(&entry.path, &entry.file, digest)?;
+                    report.restored += 1;
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&entry.file);
+                    self.working.forget(&entry.path)?;
+                    report.removed += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Put the committed content back into a working copy.
+    fn restore_working_copy(&self, path: &str, file: &Path, digest: &str) -> Result<()> {
+        let temporary = file.with_extension("restore");
+        {
+            let mut source = self.blobs.open(digest)?;
+            let mut target = std::fs::File::create(&temporary)?;
+            std::io::copy(&mut source, &mut target)?;
+            target.sync_all()?;
+        }
+        std::fs::rename(&temporary, file)?;
+        let size = std::fs::metadata(file)?.len();
+        let _ = self.working.update_size(path, size);
+        Ok(())
+    }
+
+    /// The paths whose working copy does not match the committed content.
+    pub fn inconsistent_working_copies(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for entry in self.working.list()? {
+            let Ok(metadata) = std::fs::metadata(&entry.file) else {
+                out.push(entry.path);
+                continue;
+            };
+            let Ok(Some(node)) = self.index.get(&entry.path) else {
+                out.push(entry.path);
+                continue;
+            };
+            if !node.dirty && metadata.len() != node.size {
+                out.push(entry.path);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The blobs the index refers to but that are not on disk.
+    pub fn dangling_references(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for node in self.index.all()? {
+            if let Some(digest) = node.digest {
+                if !self.blobs.contains(&digest) {
+                    out.push(node.path);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     // ─────────────────────────── conflicts ────────────────────────────
 
     /// Commit the local version of a path into the content store.
@@ -324,8 +431,7 @@ impl SyncEngine {
             return Ok(self.index.get(path)?.and_then(|node| node.digest));
         }
         let size = std::fs::metadata(&working)?.len();
-        let mut reader = std::fs::File::open(&working)?;
-        let digest = self.blobs.put_reader(&mut reader)?;
+        let digest = self.blobs.put_file(&working)?;
         let mut node = self
             .index
             .get(path)?
@@ -532,6 +638,19 @@ fn to_remote(node: &Node) -> RemoteNode {
         size: node.size,
         mtime: node.mtime,
     }
+}
+
+/// What the recovery pass did.
+#[derive(Debug, Default)]
+pub struct RecoveryReport {
+    /// Working copies that were replaced with the committed content.
+    pub restored: usize,
+    /// Local changes that were committed to the content store.
+    pub committed: usize,
+    /// Working copies that were dropped.
+    pub removed: usize,
+    /// How many bytes were read to hash the local changes.
+    pub hashed_bytes: u64,
 }
 
 #[derive(Debug, Default)]
