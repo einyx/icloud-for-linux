@@ -81,7 +81,17 @@ jobs:
       - name: Install the packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends rpm dpkg-dev fakeroot
+          sudo apt-get install -y --no-install-recommends \
+            rpm \
+            dpkg-dev \
+            fakeroot \
+            build-essential \
+            debhelper \
+            cargo \
+            rustc \
+            pkg-config \
+            libssl-dev \
+            fuse3
       - name: Build the source tarball
         run: make dist-source
       - name: Build the RPM
