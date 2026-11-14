@@ -157,12 +157,16 @@ package-rpm: dist-source ## Build the RPM (needs rpmbuild)
 	cp packaging/rpm/$(PKG).spec $(RPM_TOPDIR)/SPECS/
 	rpmbuild --define "_topdir $(RPM_TOPDIR)" --define "_dbpath $(RPM_TOPDIR)" \
 		-bb $(RPM_TOPDIR)/SPECS/$(PKG).spec
-	@echo "→ $(RPM_TOPDIR)/RPMS/"
+	@mkdir -p $(DIST_DIR)/packages
+	@cp $(RPM_TOPDIR)/RPMS/*/*.rpm $(DIST_DIR)/packages/
+	@echo "→ $(DIST_DIR)/packages/"
 
 .PHONY: package-deb
 package-deb: ## Build the Debian package (needs dpkg-buildpackage)
 	dpkg-buildpackage -us -uc -b
-	@echo "→ ../$(PKG)_$(VERSION)_*.deb"
+	@mkdir -p $(DIST_DIR)/packages
+	@cp ../$(PKG)_$(VERSION)_*.deb $(DIST_DIR)/packages/
+	@echo "→ $(DIST_DIR)/packages/"
 
 .PHONY: tag
 tag: ## Create an annotated release tag

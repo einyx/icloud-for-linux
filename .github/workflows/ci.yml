@@ -101,10 +101,8 @@ jobs:
       - name: Check the contents
         run: |
           rpm -qlp dist/rpmbuild/RPMS/*/*.rpm
-          dpkg-deb -c ../icloud-for-linux_*.deb
+          dpkg-deb -c dist/packages/*.deb
       - uses: actions/upload-artifact@v4
         with:
           name: packages
-          path: |
-            dist/rpmbuild/RPMS/**/*.rpm
-            ../icloud-for-linux_*.deb
+          path: dist/packages/*
