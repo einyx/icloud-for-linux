@@ -1,0 +1,11 @@
+icloud-for-linux (0.6.0) unstable; urgency=medium
+
+  * Rust rewrite of the iCloud Drive FUSE filesystem, licensed under
+    GPL-3.0-only.
+  * Local-first core: content addressed store, lazy path index, write ahead
+    journal.
+  * Apple protocol client: SRP sign in, two factor authentication, drive
+    service.
+  * Background hydration, on demand sync over SIGUSR1, conflict export.
+
+ -- Alessio <alessio@linux.com>  Sat, 14 Nov 2026 12:00:00 +0100

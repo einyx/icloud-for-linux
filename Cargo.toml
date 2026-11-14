@@ -1,6 +1,6 @@
 [package]
 name = "icloud-for-linux"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["einyx"]
 description = "Mount iCloud Drive on Linux as a local-first FUSE filesystem with persistent caching and sync"
@@ -17,9 +17,15 @@ path = "src/lib.rs"
 name = "icloudctl"
 path = "src/main.rs"
 
+[[bin]]
+name = "icloudctl-completions"
+path = "src/bin/completions.rs"
+required-features = ["completions"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = { version = "4", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
@@ -47,6 +53,12 @@ shellexpand = "3"
 # The HTTP stack for the iCloud protocol client is added with that client
 # (see docs/ROADMAP.md, milestone M1) so the tree stays free of unused
 # dependencies until it is actually needed.
+[features]
+default = []
+# Shell completions for icloudctl (a separate binary, so the release
+# binaries do not carry the extra code).
+completions = ["dep:clap_complete"]
+
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

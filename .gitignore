@@ -1,7 +1,16 @@
 /target
 /dist
+Cargo.lock.bak
 *.swp
 *.swo
 .DS_Store
 /.idea
 /.vscode
+
+# Debian build artefacts
+/debian/cargo
+/debian/.debhelper
+/debian/files
+/debian/*.substvars
+/debian/icloud-for-linux
+/debian/*.debhelper.log

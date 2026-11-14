@@ -1,0 +1,30 @@
+Source: icloud-for-linux
+Section: net
+Priority: optional
+Maintainer: Alessio <alessio@linux.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc,
+               pkg-config,
+               libssl-dev,
+               fuse3
+Standards-Version: 4.6.2
+Homepage: https://github.com/einyx/icloud-for-linux
+Rules-Requires-Root: no
+
+Package: icloud-for-linux
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, fuse3
+Suggests: systemd
+Description: mount iCloud Drive on Linux as a local-first FUSE filesystem
+ icloud-for-linux mounts an iCloud Drive as an ordinary folder on Linux.
+ .
+ The filesystem is local-first. The metadata is cached in a SQLite index, the
+ content is kept in a content-addressed store, and every local change is
+ written to a journal before it is uploaded. Reads are served from the local
+ store and never wait for the network; a path is resolved when it is first
+ used instead of crawling the whole drive.
+ .
+ After the installation, run "icloudctl init" to create the local store and
+ the configuration, "icloudctl auth" to sign in, and "icloudctl mount" to
+ mount the drive.

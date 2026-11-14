@@ -85,9 +85,43 @@ docker compose --profile fuse up --build mount
 ### Release tarball
 
 ```bash
-curl -LO https://github.com/einyx/icloud-for-linux/releases/latest/download/icloud-for-linux-0.2.0-linux-x86_64.tar.gz
-tar -xzf icloud-for-linux-0.2.0-linux-x86_64.tar.gz
-sudo install -m755 icloud-for-linux-0.2.0/icloudctl /usr/local/bin/icloudctl
+curl -LO https://github.com/einyx/icloud-for-linux/releases/latest/download/icloud-for-linux-0.6.0-linux-x86_64.tar.gz
+tar -xzf icloud-for-linux-0.6.0-linux-x86_64.tar.gz
+sudo install -m755 icloud-for-linux-0.6.0/icloudctl /usr/local/bin/icloudctl
+sudo install -m644 icloud-for-linux-0.6.0/icloudctl.1 /usr/local/share/man/man1/
+```
+
+### Packages
+
+The packages carry the binary, the man page, the shell completions and the
+systemd user unit. They are built from the source tarball in the repository and
+verified by the continuous integration on every push.
+
+| Distribution | How to build it |
+| --- | --- |
+| RPM (Fedora, openSUSE, RHEL) | `make package-rpm` → `dist/rpmbuild/RPMS/` |
+| Debian / Ubuntu | `make package-deb` → `../icloud-for-linux_*.deb` |
+| Nix | `nix build` (a flake is included) |
+| Arch (AUR) | `packaging/aur/PKGBUILD` |
+
+```bash
+# Fedora
+sudo dnf install ./dist/rpmbuild/RPMS/x86_64/icloud-for-linux-*.rpm
+
+# Debian / Ubuntu
+sudo apt install ../icloud-for-linux_*.deb
+
+# Nix
+nix run . -- --help
+```
+
+After the installation:
+
+```bash
+icloudctl init ~/iCloud
+icloudctl configure
+icloudctl auth
+systemctl --user start icloud-for-linux.service
 ```
 
 ## Quick setup

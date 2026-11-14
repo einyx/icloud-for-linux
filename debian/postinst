@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+# The session and the credentials live in the user's home directory; the
+# directory is created with owner-only permissions.
+if [ "$1" = "configure" ]; then
+    if [ -d /etc/icloud-for-linux ]; then
+        chmod 0750 /etc/icloud-for-linux
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

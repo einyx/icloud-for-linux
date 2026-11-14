@@ -46,17 +46,19 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CFLAGS_aarch64_unknown_linux_gnu: -march=armv8-a
 
       - name: Package
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           stage="dist/icloud-for-linux-${version}"
           mkdir -p "$stage"
-          install -Dm755 "target/${{ matrix.target }}/release/icloudctl" "$stage/icloudctl"
+          install -Dm755 "target/${matrix.target}/release/icloudctl" "$stage/icloudctl"
           install -Dm644 LICENSE "$stage/LICENSE"
           install -Dm644 README.md "$stage/README.md"
-          install -Dm644 config.example.yaml "$stage/config.example.yaml"
-          tar -czf "dist/icloud-for-linux-${version}-linux-${{ matrix.arch }}.tar.gz" -C dist "icloud-for-linux-${version}"
+          install -Dm644 config.example.yaml "$stage/config.yaml.example"
+          install -Dm644 docs/icloudctl.1 "$stage/icloudctl.1"
+          tar -czf "dist/icloud-for-linux-${version}-linux-${matrix.arch}.tar.gz" -C dist "icloud-for-linux-${version}"
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
@@ -77,11 +79,28 @@ jobs:
             ```bash
             tar -xzf icloud-for-linux-*-linux-x86_64.tar.gz
             sudo install -m755 icloud-for-linux-*/icloudctl /usr/local/bin/icloudctl
+            sudo install -m644 icloud-for-linux-*/icloudctl.1 /usr/local/share/man/man1/
             icloudctl init ~/iCloud
             icloudctl configure
             icloudctl auth
             icloudctl mount ~/iCloud
             ```
 
+            Packages for the common distributions are built from the source
+            tarball in the repository: `packaging/rpm`, `debian/`, `nix/` and
+            `packaging/aur`.
+
             See the repository README for the full documentation and
             [docs/ROADMAP.md](docs/ROADMAP.md) for the current feature status.
+
+  source:
+    name: source tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the source tarball
+        run: make dist-source
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: dist/icloud-for-linux-*.tar.gz

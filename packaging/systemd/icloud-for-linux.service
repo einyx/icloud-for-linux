@@ -1,0 +1,20 @@
+[Unit]
+Description=iCloud Drive FUSE filesystem (user)
+Documentation=https://github.com/einyx/icloud-for-linux
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The mount point and the configuration are read from
+# ~/.config/icloud-for-linux/icloud.env, which `icloudctl init` writes.
+ExecStart=/usr/bin/icloudctl mount --foreground
+ExecStop=/usr/bin/icloudctl unmount
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=10
+KillMode=control-group
+Environment=ICLOUD_LOG_PATH=%h/.local/state/icloud-for-linux/icloud.log
+
+[Install]
+WantedBy=default.target

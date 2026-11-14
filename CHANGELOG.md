@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — packaging
+
+### Added
+
+- **RPM package** (`packaging/rpm/icloud-for-linux.spec`) with the binary, the
+  man page, the bash completion, the systemd user unit and the configuration
+  example.
+- **Debian package** (`debian/`) with the same content.
+- **Nix flake** (`flake.nix`, `nix/package.nix`) with a package, an app and a
+  development shell.
+- **AUR recipe** (`packaging/aur/PKGBUILD`).
+- **A man page** (`docs/icloudctl.1`) that documents every command.
+- **Shell completions** for bash, zsh, fish and elvish, generated from the
+  command line definition, so they cannot drift away from it.
+- **A source tarball** (`make dist-source`) that every package is built from.
+- **A packaging job in the continuous integration** that builds the RPM and
+  the Debian package and lists their contents, so the packaging cannot rot.
+
+### Changed
+
+- The command line definition moved into the library, so the binary and the
+  completion generator share one source of truth.
+- `make install` now installs the binary, the man page, the systemd user unit
+  and the configuration example, and honours `DESTDIR` and `PREFIX`.
+
 ## [0.5.0] — parity and hardening
 
 ### Added

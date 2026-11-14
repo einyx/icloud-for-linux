@@ -1,0 +1,116 @@
+.TH ICLOUDCTL 1 "2026-11-14" "icloud-for-linux 0.6.0" "User Commands"
+.SH NAME
+icloudctl \- mount iCloud Drive on Linux as a local-first FUSE filesystem
+.SH SYNOPSIS
+.B icloudctl
+.RI [ command ] [ options ]
+.SH DESCRIPTION
+.B icloudctl
+mounts an iCloud Drive as an ordinary folder on Linux.
+.PP
+The filesystem is local-first: the metadata is cached in a SQLite index, the
+content is kept in a content-addressed store, and every local change is written
+to a journal before it is uploaded. Reads are served from the local store and
+never wait for the network.
+.PP
+Without a command,
+.B icloudctl
+prints a summary of its commands.
+.SH COMMANDS
+.TP
+.B init \fR[\fImount_dir\fR]\fP
+Create the local store, the configuration file and the systemd user unit.
+The mount point defaults to \fI~/iCloud\fR.
+.TP
+.B configure \fR[\fIemail\fR]\fP
+Write the configuration with the Apple ID. The password is read from the
+terminal and stored with owner-only permissions.
+.TP
+.B auth \fR[\fB--force-sms\fR] [\fB--debug\fR] [\fB--accept-terms\fR]\fP
+Run the interactive Apple ID sign-in and answer the two-factor challenge.
+.B --force-sms
+requests the code by SMS instead of waiting for the notification.
+.B --debug
+prints the authentication mode the service reported.
+.TP
+.B mount \fR[\fImount_dir\fR] [\fB--config\fR \fIfile\fR] [\fB--foreground\fR]\fP
+Mount the filesystem. The mount point defaults to the value in
+.IR icloud.env .
+Without a valid session the driver starts in unauthenticated mode and serves
+the local store.
+.TP
+.B unmount \fR[\fImount_dir\fR]\fP
+Unmount the filesystem.
+.TP
+.B sync \fR[\fB--dry-run\fR] [\fB--timeout\fR \fIseconds\fR]\fP
+Run one synchronisation pass: drain the journal and refresh the metadata that
+went stale. When the driver is running, the pass is requested over
+.B SIGUSR1
+and the command waits for the completion marker.
+.TP
+.B hydrate \fR[\fB--dry-run\fR] [\fB--path\fR \fIpath\fR]\fP
+Download the content of the eligible files into the local store. With
+.B --path
+the subtree is listed through the service first, so a folder can be prefetched
+without crawling the whole drive.
+.TP
+.B conflicts
+List the conflicts that were preserved.
+.TP
+.B export-conflicts \fIdirectory\fP
+Write the preserved conflict versions into a directory.
+.TP
+.B export \fIpath directory\fP
+Materialise a subtree of the drive as plain files.
+.TP
+.B verify
+Re-hash every blob and report corrupt blobs, missing content and working
+copies that do not match the committed content.
+.TP
+.B gc
+Remove the blobs that nothing refers to any more.
+.TP
+.B index
+Show what the local index knows.
+.TP
+.B status
+Show whether the service is running.
+.TP
+.B logs
+Show the service logs.
+.TP
+.B doctor
+Check the local setup and report what is missing.
+.TP
+.B clear-cache
+Remove the local store. It is rebuilt on the next start.
+.SH FILES
+.TP
+.I ~/.config/icloud-for-linux/config.yaml
+The configuration: credentials, the store location, the synchronisation
+boundary and the FUSE options.
+.TP
+.I ~/.config/icloud-for-linux/icloud.env
+The mount point and the configuration file, as seen by the service.
+.TP
+.I ~/.config/icloud-for-linux/cookies
+The session cookies and the session data.
+.TP
+.I ~/.config/systemd/user/icloud-for-linux.service
+The user service.
+.TP
+.I ~/.cache/icloud-for-linux
+The local store: the content store, the working copies, the index and the
+journal.
+.TP
+.I ~/.local/state/icloud-for-linux
+The logs and the completion marker of an on-demand sync.
+.SH SEE ALSO
+.BR fusermount3 (1),
+.BR systemctl (1)
+.PP
+The project documentation:
+.UR https://github.com/einyx/icloud-for-linux
+.UE
+.SH LICENSE
+GNU General Public License version 3 or later.

@@ -69,12 +69,15 @@ side computation rather than a recorded value.
 - FUSE edge cases: `fallocate`, xattrs, `renameat2`, files > 4 GB, `fsync`
   ordering
 
-### M4 — Distribution
+### M4 — Distribution ✅ done
 
-- release tarballs + container images (already wired in CI)
-- AUR / Nix flake packaging
-- `icloudctl doctor` covering kernel FUSE version, `/dev/fuse` permissions,
-  clock skew
+- release tarballs, source tarball and container images (wired in CI) ✅
+- RPM spec, Debian packaging, a Nix flake and an AUR recipe, all built from
+  the same source tarball and verified by the packaging job of the continuous
+  integration ✅
+- a man page and the shell completions (bash, zsh, fish) ship with the
+  packages ✅
+- `icloudctl doctor` checks the FUSE device, the service and the store ✅
 
 ## Design decisions to revisit
 

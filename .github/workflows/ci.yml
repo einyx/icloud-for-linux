@@ -70,3 +70,31 @@ jobs:
         run: docker build -t icloud-for-linux:ci .
       - name: Smoke test
         run: docker run --rm icloud-for-linux:ci --version
+
+  packaging:
+    name: packages (rpm + deb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm dpkg-dev fakeroot
+      - name: Build the source tarball
+        run: make dist-source
+      - name: Build the RPM
+        run: make package-rpm
+      - name: Build the Debian package
+        run: make package-deb
+      - name: Check the contents
+        run: |
+          rpm -qlp dist/rpmbuild/RPMS/*/*.rpm
+          dpkg-deb -c ../icloud-for-linux_*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            dist/rpmbuild/RPMS/**/*.rpm
+            ../icloud-for-linux_*.deb

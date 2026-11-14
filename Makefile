@@ -14,10 +14,19 @@ SHELL := /bin/bash
 BINARY      := icloudctl
 PKG         := icloud-for-linux
 VERSION     := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-TARGET_DIR  := target
+# Ask cargo where it puts the build output: it may be redirected by a
+# configuration file, so the path cannot be guessed.
+TARGET_DIR  ?= $(shell cargo metadata --format-version 1 --no-deps 2>/dev/null \
+	| sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 DIST_DIR    := dist
 REPO        := einyx/icloud-for-linux
 CARGO       ?= cargo
+PREFIX      ?= /usr/local
+DESTDIR     ?=
+MANDIR      ?= $(PREFIX)/share/man
+DATADIR     ?= $(PREFIX)/share
+SYSCONFDIR  ?= /etc
+RPM_TOPDIR  ?= $(CURDIR)/dist/rpmbuild
 
 # Keep release artifacts reproducible.
 export SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct 2>/dev/null || date +%s)
@@ -45,9 +54,22 @@ run: ## Run the CLI (ARGS="--help")
 	$(CARGO) run -- $(ARGS)
 
 .PHONY: install
-install: release ## Install the binary to ~/.local/bin
-	install -Dm755 $(TARGET_DIR)/release/$(BINARY) $(HOME)/.local/bin/$(BINARY)
-	@echo "installed ~/.local/bin/$(BINARY)"
+install: release completions ## Install the binary, the man page and the completions
+	install -Dm755 $(TARGET_DIR)/release/$(BINARY) $(DESTDIR)$(PREFIX)/bin/$(BINARY)
+	install -Dm644 docs/icloudctl.1 $(DESTDIR)$(MANDIR)/man1/icloudctl.1
+	install -Dm644 config.example.yaml \
+		$(DESTDIR)$(SYSCONFDIR)/icloud-for-linux/config.yaml.example
+	install -Dm644 packaging/systemd/icloud-for-linux.service \
+		$(DESTDIR)$(PREFIX)/lib/systemd/user/icloud-for-linux.service
+	@echo "installed into $(DESTDIR)$(PREFIX)"
+
+.PHONY: completions
+completions: ## Generate the shell completions into dist/completions
+	@mkdir -p $(DIST_DIR)/completions
+	$(CARGO) build --release --features completions --bin $(BINARY)-completions
+	$(TARGET_DIR)/release/$(BINARY)-completions bash > $(DIST_DIR)/completions/$(BINARY).bash
+	$(TARGET_DIR)/release/$(BINARY)-completions zsh  > $(DIST_DIR)/completions/_$(BINARY)
+	$(TARGET_DIR)/release/$(BINARY)-completions fish > $(DIST_DIR)/completions/$(BINARY).fish
 
 # ───────────────────────────── quality ───────────────────────────────
 .PHONY: fmt
@@ -112,6 +134,35 @@ dist: release ## Produce a release tarball in dist/
 	@tar -czf $(DIST_DIR)/$(PKG)-$(VERSION)-linux-$(ARCH).tar.gz -C $(DIST_DIR) $(PKG)-$(VERSION)
 	@rm -rf $(DIST_DIR)/$(PKG)-$(VERSION)
 	@echo "→ $(DIST_DIR)/$(PKG)-$(VERSION)-linux-$(ARCH).tar.gz"
+
+.PHONY: dist-source
+dist-source: ## Produce the source tarball the packages are built from
+	@rm -rf $(DIST_DIR)/$(PKG)-$(VERSION) $(DIST_DIR)/$(PKG)-$(VERSION).tar.gz
+	@mkdir -p $(DIST_DIR)/$(PKG)-$(VERSION)
+	@tar -cf - --exclude=target --exclude=dist --exclude=.git \
+		Cargo.toml Cargo.lock LICENSE NOTICE README.md CHANGELOG.md \
+		CONTRIBUTING.md config.example.yaml rustfmt.toml \
+		Makefile Dockerfile Dockerfile.dev docker-compose.yml \
+		src tests docs packaging debian flake.nix nix \
+		| tar -xf - -C $(DIST_DIR)/$(PKG)-$(VERSION)
+	@tar -czf $(DIST_DIR)/$(PKG)-$(VERSION).tar.gz -C $(DIST_DIR) $(PKG)-$(VERSION)
+	@rm -rf $(DIST_DIR)/$(PKG)-$(VERSION)
+	@echo "→ $(DIST_DIR)/$(PKG)-$(VERSION).tar.gz"
+
+.PHONY: package-rpm
+package-rpm: dist-source ## Build the RPM (needs rpmbuild)
+	@mkdir -p $(RPM_TOPDIR)/SOURCES $(RPM_TOPDIR)/SPECS $(RPM_TOPDIR)/BUILD \
+		$(RPM_TOPDIR)/RPMS $(RPM_TOPDIR)/SRPMS
+	cp $(DIST_DIR)/$(PKG)-$(VERSION).tar.gz $(RPM_TOPDIR)/SOURCES/
+	cp packaging/rpm/$(PKG).spec $(RPM_TOPDIR)/SPECS/
+	rpmbuild --define "_topdir $(RPM_TOPDIR)" --define "_dbpath $(RPM_TOPDIR)" \
+		-bb $(RPM_TOPDIR)/SPECS/$(PKG).spec
+	@echo "→ $(RPM_TOPDIR)/RPMS/"
+
+.PHONY: package-deb
+package-deb: ## Build the Debian package (needs dpkg-buildpackage)
+	dpkg-buildpackage -us -uc -b
+	@echo "→ ../$(PKG)_$(VERSION)_*.deb"
 
 .PHONY: tag
 tag: ## Create an annotated release tag

@@ -1,0 +1,38 @@
+# Maintainer: Alessio <alessio@linux.com>
+pkgname=icloud-for-linux
+pkgver=0.6.0
+pkgrel=1
+pkgdesc="Mount iCloud Drive on Linux as a local-first FUSE filesystem"
+arch=('x86_64' 'aarch64')
+url="https://github.com/einyx/icloud-for-linux"
+license=('GPL-3.0-only')
+depends=('fuse3')
+makedepends=('cargo' 'rustc' 'pkg-config')
+optdepends=('bash-completion: bash completion')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+# The release tarball holds the binary; the source tarball is built with
+# `make dist-source` and carries the whole tree.
+build() {
+    cd "$pkgname-$pkgver"
+    cargo build --release --locked
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    cargo test --release --locked --no-run
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 target/release/icloudctl "$pkgdir/usr/bin/icloudctl"
+    install -Dm644 docs/icloudctl.1 "$pkgdir/usr/share/man/man1/icloudctl.1"
+    install -Dm644 config.example.yaml \
+        "$pkgdir/etc/icloud-for-linux/config.yaml.example"
+    install -Dm644 packaging/systemd/icloud-for-linux.service \
+        "$pkgdir/usr/lib/systemd/user/icloud-for-linux.service"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+}
