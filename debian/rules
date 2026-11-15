@@ -30,8 +30,10 @@ override_dh_auto_install:
 		debian/icloud-for-linux/etc/icloud-for-linux/config.yaml.example
 	install -Dm644 packaging/systemd/icloud-for-linux.service \
 		debian/icloud-for-linux/lib/systemd/user/icloud-for-linux.service
-	install -Dm644 $(CARGO_TARGET_DIR)/release/icloudctl-completions \
-		debian/icloud-for-linux/usr/share/bash-completion/completions/icloudctl
+	# The completion script is generated from the command line definition.
+	mkdir -p debian/icloud-for-linux/usr/share/bash-completion/completions
+	$(CARGO_TARGET_DIR)/release/icloudctl-completions bash \
+		> debian/icloud-for-linux/usr/share/bash-completion/completions/icloudctl
 
 override_dh_auto_clean:
 	cargo clean

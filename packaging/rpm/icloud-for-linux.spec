@@ -41,8 +41,10 @@ install -Dm644 docs/icloudctl.1 %{buildroot}%{_mandir}/man1/icloudctl.1
 install -Dm644 config.example.yaml %{buildroot}%{_sysconfdir}/%{crate}/config.yaml.example
 install -Dm644 packaging/systemd/icloud-for-linux.service \
     %{buildroot}%{_prefix}/lib/systemd/user/%{crate}.service
-install -Dm644 target/release/icloudctl-completions \
-    %{buildroot}%{_datadir}/bash-completion/completions/%{crate}
+# The completion script is generated from the command line definition.
+mkdir -p %{buildroot}%{_datadir}/bash-completion/completions
+target/release/icloudctl-completions bash \
+    > %{buildroot}%{_datadir}/bash-completion/completions/%{crate}
 
 %check
 # The tests are only compiled here: the build environment has no FUSE device.

@@ -1,11 +1,11 @@
 #!/bin/sh
 set -e
 
-# The session and the credentials live in the user's home directory; the
-# directory is created with owner-only permissions.
+# The session and the credentials live in the user's home directory; this
+# directory only holds the example, so everyone has to be able to read it.
 if [ "$1" = "configure" ]; then
     if [ -d /etc/icloud-for-linux ]; then
-        chmod 0750 /etc/icloud-for-linux
+        chmod 0755 /etc/icloud-for-linux
     fi
 fi
 
